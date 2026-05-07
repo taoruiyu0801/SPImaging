@@ -92,6 +92,7 @@ spad-evaluate --help
 │   ├── self_supervised_training/   # 自监督 SPISR 训练入口，对应 spad-train-selfsup
 │   ├── testing/                    # 检查、浏览与 checkpoint 推理，对应 spad-verify/browse/predict
 │   └── training_common/            # 训练共享的 Dataset、loss、network、checkpoint 工具
+├── example_data/                   # 仓库内置的少量可运行样例数据
 ├── middlebury/
 │   ├── raw/                        # Middlebury 原始数据，需自行准备
 │   └── processed*/                 # 生成后的样本目录
@@ -99,6 +100,53 @@ spad-evaluate --help
 ```
 
 ## 数据准备
+
+本仓库包含一小份可直接运行的样例数据，路径为：
+
+```text
+example_data/nyuv2_raw_single_random_snr/
+├── index.csv
+├── sample_00000.npz
+├── sample_00001.npz
+├── sample_00002.npz
+└── sample_00003.npz
+```
+
+这 4 个样本来自 NYUv2 raw 数据，经本项目 `single` 单表面模型生成，空间分辨率为 `64x64`，时间维为 `1024` bins，`param_idx=10`，即信号光子数与 SBR 随机采样。它们适合快速验证安装、可视化、Dataset 读取、训练 smoke test 和评估脚本，不适合作为正式训练集。
+
+快速检查内置样例：
+
+```bash
+spad-verify \
+  --dataset_dir example_data/nyuv2_raw_single_random_snr \
+  --index 0 \
+  --save_fig outputs/example_verify_sample_00000.png
+```
+
+用内置样例跑一个最小监督训练：
+
+```bash
+spad-train \
+  --dataset_dir example_data/nyuv2_raw_single_random_snr \
+  --output_dir outputs/train_example_simple3d \
+  --epochs 1 \
+  --batch_size 1 \
+  --model simple3d \
+  --base_channels 2 \
+  --temporal_downsample 64 \
+  --tv_weight 0.005 \
+  --val_fraction 0.25 \
+  --num_workers 0
+```
+
+完整数据集不随仓库上传，请按需要从官方来源下载：
+
+| 数据集 | 官方入口 | 本项目默认放置位置 |
+| --- | --- | --- |
+| NYU Depth Dataset V2 labeled/raw | <https://cs.nyu.edu/~fergus/datasets/nyu_depth_v2.html> | `NYUv2/nyu_depth_v2_labeled.mat`、`NYUv2/raw/` |
+| Middlebury Stereo 2006 scenes | <https://vision.middlebury.edu/stereo/data/scenes2006/> | `middlebury/raw/` |
+
+下载完整数据后，再使用 `spad-generate` 转成项目需要的 `.npz` photon-counting 样本。
 
 ### Middlebury
 

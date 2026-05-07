@@ -27,3 +27,9 @@ middlebury/processed*/
 *.jpeg
 *.tif
 *.tiff
+
+# Keep a tiny runnable dataset in the repository.
+!example_data/
+!example_data/**
+!example_data/**/*.npz
+!example_data/**/*.csv
