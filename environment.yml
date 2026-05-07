@@ -1,0 +1,16 @@
+name: spimaging
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy<2
+  - scipy
+  - h5py
+  - imageio
+  - scikit-image
+  - matplotlib
+  - tqdm
+  - pip:
+      - opencv-python
+      - -e .

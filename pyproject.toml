@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spimaging"
+version = "0.1.0"
+description = "Generate SPAD-style single-photon imaging measurements from RGB-D datasets."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy<2",
+    "scipy",
+    "h5py",
+    "imageio",
+    "scikit-image",
+    "matplotlib",
+    "tqdm",
+    "opencv-python",
+]
+
+[project.optional-dependencies]
+single-surface = ["torch", "deepinv"]
+training = ["torch", "deepinv"]
+
+[project.scripts]
+spad-generate = "spimaging.generation.pipeline:main"
+spad-train = "spimaging.supervised_training.train:main"
+spad-train-selfsup = "spimaging.self_supervised_training.train:main"
+spad-predict = "spimaging.testing.predict:main"
+spad-evaluate = "spimaging.testing.evaluate:main"
+spad-verify = "spimaging.testing.verify:main"
+spad-browse = "spimaging.testing.browse:main"
+spad-browse-4modes = "spimaging.testing.browse:main"
+
+[tool.setuptools.packages.find]
+include = ["spimaging*"]
