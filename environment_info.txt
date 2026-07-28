@@ -1,0 +1,19 @@
+﻿Python: 3.10.20 | packaged by conda-forge | (main, Jun 11 2026, 03:28:51) [MSC v.1944 64 bit (AMD64)]
+Python executable: C:\Users\32499\anaconda3\envs\spimaging\python.exe
+Platform: Windows-10-10.0.26200-SP0
+numpy: 1.26.4
+scipy: 1.15.2
+h5py: 3.16.0
+imageio: 2.37.0
+scikit-image: 0.25.2
+matplotlib: 3.10.9
+tqdm: 4.69.0
+opencv-python: 4.11.0.86
+deepinv: 0.4.1
+torch: 2.11.0+cu130
+torchvision: 0.26.0+cu130
+torchaudio: 2.11.0+cu130
+PyTorch CUDA runtime: 13.0
+CUDA available: True
+cuDNN: 91900
+GPU: NVIDIA GeForce RTX 5070 Ti Laptop GPU
