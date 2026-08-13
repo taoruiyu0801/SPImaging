@@ -76,6 +76,7 @@ spad-train --help
 spad-train-selfsup --help
 spad-predict --help
 spad-evaluate --help
+spad-demo --help
 ```
 
 ### 命令行参数与路径规则
@@ -96,6 +97,7 @@ spad-evaluate --help
 ├── environment.yml                 # Conda 环境配置
 ├── requirements.txt                # pip 依赖列表
 ├── spimaging/
+│   ├── demo.py                     # 无界面的一键检查、训练、预测和评估入口
 │   ├── generation/                 # 数据生成：数据读取、预处理、SPAD 测量模型、spad-generate
 │   ├── supervised_training/        # 有监督深度重建训练入口，对应 spad-train
 │   ├── self_supervised_training/   # 自监督 SPISR 训练入口，对应 spad-train-selfsup
@@ -150,6 +152,40 @@ spad-train \
   --val_fraction 0.25 \
   --num_workers 0
 ```
+
+### 一键稳定演示
+
+安装训练依赖后，可以用一个无界面入口串行完成“检查样例—最小训练—预测—评估”：
+
+```bash
+spad-demo
+```
+
+默认读取 `example_data/nyuv2_raw_single_random_snr`，输出到 `outputs/demo`。也可以指定其他包含至少两个有效样本的数据集：
+
+```bash
+spad-demo \
+  --dataset_dir example_data/nyuv2_raw_single_random_snr \
+  --output_dir outputs/demo
+```
+
+演示固定使用轻量配置训练 1 个 epoch，并在独立子进程中执行四个现有入口。Matplotlib 使用无界面后端，因此不会打开窗口或抢占桌面焦点。输出包括：
+
+```text
+outputs/demo/
+├── verify/sample_00000.png
+├── train/last.pt
+├── train/best.pt
+├── predict/prediction.npz
+├── predict/comparison.png
+├── evaluate/metrics_per_sample.csv
+├── evaluate/metrics_summary.json
+├── evaluate/comparison.png
+├── demo.log
+└── demo_summary.json
+```
+
+已有非空输出目录默认拒绝写入。需要重跑时使用 `--overwrite`；该参数只替换 demo 管理的产物，输出目录中的无关文件会保留。四个阶段全部成功并通过产物校验后，临时 staging 结果才会发布到正式目录；失败时不会留下半成品正式输出。
 
 完整数据集不随仓库上传，请按需要从官方来源下载：
 

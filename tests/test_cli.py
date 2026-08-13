@@ -88,6 +88,7 @@ class CliContractTests(unittest.TestCase):
         "spimaging.testing.evaluate",
         "spimaging.testing.verify",
         "spimaging.testing.browse",
+        "spimaging.demo",
     )
 
     def run_entry(

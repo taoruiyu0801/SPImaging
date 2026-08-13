@@ -31,6 +31,7 @@ spad-predict = "spimaging.testing.predict:main"
 spad-evaluate = "spimaging.testing.evaluate:main"
 spad-verify = "spimaging.testing.verify:main"
 spad-browse = "spimaging.testing.browse:main"
+spad-demo = "spimaging.demo:main"
 spad-browse-4modes = "spimaging.testing.browse:main"
 
 [tool.setuptools.packages.find]
