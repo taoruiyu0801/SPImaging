@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-08-13T18:55:58+08:00",
+  "purpose": "Day 19 small-data pretrained checkpoint for a fast SPImaging demonstration",
+  "dataset": {
+    "path": "example_data/nyuv2_raw_single_random_snr",
+    "sample_count": 4,
+    "sample_total_bytes": 4073807,
+    "sample_shape": {
+      "counts": [1024, 64, 64],
+      "depth_m": [64, 64]
+    },
+    "samples": [
+      {
+        "name": "sample_00000.npz",
+        "bytes": 1767454,
+        "sha256": "f5563ae3421e84c38e1918e4cb2223a146ceddd364a2f423f262d8493223af6d"
+      },
+      {
+        "name": "sample_00001.npz",
+        "bytes": 250933,
+        "sha256": "fa6aec0e3023c8be849405157f679338978de3a1d01d2228723299a59fa4452d"
+      },
+      {
+        "name": "sample_00002.npz",
+        "bytes": 769068,
+        "sha256": "255fb5933d45af2ffd6ec9080b4e97ef2a4e62f9329b5a8171c55083b5dfaf53"
+      },
+      {
+        "name": "sample_00003.npz",
+        "bytes": 1286352,
+        "sha256": "3e9084896ed63b4e88fcec37e3ca593faeb2e5a29b234f65ab50bedacc76461a"
+      }
+    ]
+  },
+  "checkpoint": {
+    "path": "demo_checkpoint/simple3d_demo_best.pt",
+    "bytes": 33409,
+    "sha256": "a015d6e66a3f1b2662af3f9f43bbe6afcc704b4a3261aa1af132bb295c9052b4",
+    "model_name": "simple3d",
+    "method_family": "supervised",
+    "epoch": 20,
+    "best_validation_mae_m": 0.648086667060852
+  },
+  "training": {
+    "device": "cuda",
+    "train_samples": 3,
+    "validation_samples": 1,
+    "completed_epochs": 20,
+    "early_stopped": false,
+    "arguments": {
+      "batch_size": 1,
+      "learning_rate": 0.001,
+      "weight_decay": 0.00001,
+      "validation_fraction": 0.25,
+      "seed": 0,
+      "num_workers": 0,
+      "base_channels": 2,
+      "temporal_downsample": 64,
+      "target_sigma_bins": 2.0,
+      "target_source": "depth",
+      "tv_weight": 0.005,
+      "early_stopping_patience": 5,
+      "early_stopping_min_delta_m": 0.0001
+    }
+  },
+  "verification": {
+    "prediction_sample": "sample_00000.npz",
+    "evaluation_note": "Smoke metrics on the same four tiny demo samples used for training/validation; not an independent test set.",
+    "automatic_cuda": {
+      "total_duration_seconds": 6.267,
+      "prediction_seconds": 2.984,
+      "evaluation_seconds": 3.284,
+      "n_samples": 4,
+      "mae_m": 0.8001202046871185,
+      "rmse_m": 0.874944418668747,
+      "abs_rel": 0.12467328831553459
+    },
+    "forced_cpu": {
+      "total_duration_seconds": 5.217,
+      "prediction_seconds": 2.552,
+      "evaluation_seconds": 2.665,
+      "n_samples": 4,
+      "mae_m": 0.8001202046871185,
+      "rmse_m": 0.8749444335699081,
+      "abs_rel": 0.12467329204082489
+    },
+    "time_limit_seconds": 600,
+    "passed_time_limit": true
+  },
+  "runtime": {
+    "python": "3.10.20",
+    "torch": "2.11.0+cu130",
+    "cuda_device": "NVIDIA GeForce RTX 5070 Ti Laptop GPU"
+  }
+}

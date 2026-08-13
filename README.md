@@ -79,6 +79,8 @@ spad-evaluate --help
 spad-demo --help
 ```
 
+这些命令安装在当前 Python/Conda 环境中。如果 PowerShell 提示命令不存在，先确认已激活 `spimaging`；也可以不切换当前环境，直接使用 `conda run -n spimaging spad-demo`。如果电脑上有多套 Conda，使用 `conda activate <spimaging环境的完整路径>` 可以避免激活到错误环境。
+
 ### 命令行参数与路径规则
 
 - 参数名称统一使用下划线风格。`spad-predict` 使用 `--sample_file`，`spad-verify` 使用 `--sample_name` 和 `--output_fig`，`spad-browse` 使用 `--output_dir`。
@@ -107,6 +109,7 @@ spad-demo --help
 ├── tests/                          # CLI 参数、错误提示和无副作用回归测试
 ├── record_of_SPI/Day_13-14/        # 参数表与代表性异常提示截图
 ├── example_data/                   # 仓库内置的少量可运行样例数据
+├── demo_checkpoint/                # 与内置样例配套的预训练 Simple3D 演示模型
 ├── middlebury/
 │   ├── raw/                        # Middlebury 原始数据，需自行准备
 │   └── processed*/                 # 生成后的样本目录
@@ -127,6 +130,8 @@ example_data/nyuv2_raw_single_random_snr/
 ```
 
 这 4 个样本来自 NYUv2 raw 数据，经本项目 `single` 单表面模型生成，空间分辨率为 `64x64`，时间维为 `1024` bins，`param_idx=10`，即信号光子数与 SBR 随机采样。它们适合快速验证安装、可视化、Dataset 读取、训练 smoke test 和评估脚本，不适合作为正式训练集。
+
+这套已跟踪的 `example_data` 同时作为项目的 demo data，不另建一份内容重复的 `demo_data`。数据说明见 [`example_data/README.md`](example_data/README.md)。
 
 快速检查内置样例：
 
@@ -186,6 +191,26 @@ outputs/demo/
 ```
 
 已有非空输出目录默认拒绝写入。需要重跑时使用 `--overwrite`；该参数只替换 demo 管理的产物，输出目录中的无关文件会保留。四个阶段全部成功并通过产物校验后，临时 staging 结果才会发布到正式目录；失败时不会留下半成品正式输出。
+
+### 使用预训练 checkpoint 快速演示
+
+如果只需要演示“加载已有模型—预测—评估”，可以使用 Day 19 基于上述 4 个样本重新训练的轻量 checkpoint：
+
+```powershell
+conda run -n spimaging spad-predict `
+    --checkpoint demo_checkpoint/simple3d_demo_best.pt `
+    --sample_file example_data/nyuv2_raw_single_random_snr/sample_00000.npz `
+    --output_npz outputs/day19_quick_demo/predict/prediction.npz `
+    --output_fig outputs/day19_quick_demo/predict/comparison.png
+
+conda run -n spimaging spad-evaluate `
+    --checkpoint demo_checkpoint/simple3d_demo_best.pt `
+    --label day19-simple3d `
+    --dataset_dir example_data/nyuv2_raw_single_random_snr `
+    --output_dir outputs/day19_quick_demo/evaluate
+```
+
+checkpoint 只有约 33 KiB；配套的 4 个 NPZ 约 3.9 MiB。在 Day 19 验收中，单样本预测加 4 样本评估使用 CUDA 耗时 6.267 秒，强制使用 CPU 耗时 5.217 秒，均远低于 10 分钟。训练与评估使用同一小型样本集合，指标只用于 smoke demo，不代表独立测试集精度。完整哈希、参数和指标见 [`demo_checkpoint/manifest.json`](demo_checkpoint/manifest.json)。
 
 完整数据集不随仓库上传，请按需要从官方来源下载：
 
