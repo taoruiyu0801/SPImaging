@@ -1,19 +1,28 @@
 import argparse
-import os
 from pathlib import Path
 import random
-
-_matplotlib_cache_dir = Path("outputs/.matplotlib-cache").resolve()
-_matplotlib_cache_dir.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("MPLCONFIGDIR", str(_matplotlib_cache_dir))
+import zipfile
 
 import matplotlib.pyplot as plt
 import numpy as np
 
+from spimaging.cli import (
+    ArgumentParser,
+    HelpFormatter,
+    create_output_parent,
+    nonnegative_int,
+    require_directory,
+    require_file,
+    validate_npz_archive,
+    validate_output_file,
+)
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Verify and visualize generated SPAD dataset samples."
+
+def build_parser():
+    parser = ArgumentParser(
+        prog="spad-verify",
+        description="Verify and visualize one generated SPAD dataset sample.",
+        formatter_class=HelpFormatter,
     )
     parser.add_argument(
         "--dataset_dir",
@@ -21,30 +30,45 @@ def parse_args():
         required=True,
         help="Directory containing generated .npz samples.",
     )
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--sample_name",
         "--sample",
+        dest="sample_name",
         type=str,
         default=None,
-        help="Specific sample filename, e.g. sample_00010.npz",
+        help="Sample filename within --dataset_dir; --sample is a compatibility alias.",
     )
-    parser.add_argument(
+    selection.add_argument(
         "--index",
-        type=int,
+        type=nonnegative_int,
         default=None,
-        help="Sample index in sorted file list, e.g. 0 means the first sample.",
+        metavar="INDEX",
+        help="Zero-based sample index in the sorted file list (must exist).",
     )
-    parser.add_argument(
+    selection.add_argument(
         "--random",
         action="store_true",
         help="Randomly choose one sample from dataset_dir.",
     )
     parser.add_argument(
+        "--output_fig",
         "--save_fig",
+        dest="output_fig",
         type=str,
         default=None,
-        help="Optional path to save the visualization figure.",
+        help="Optional path for a PNG, JPEG, PDF, or SVG visualization; --save_fig is a compatibility alias.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow an existing --output_fig file to be replaced.",
+    )
+    return parser
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
 
 
 def list_npz_files(dataset_dir: Path):
@@ -58,8 +82,8 @@ def choose_sample(files, args):
     if len(files) == 0:
         raise FileNotFoundError("No .npz files found in the specified dataset directory.")
 
-    if args.sample is not None:
-        sample_path = Path(args.dataset_dir) / args.sample
+    if args.sample_name is not None:
+        sample_path = Path(args.dataset_dir) / args.sample_name
         if not sample_path.exists():
             raise FileNotFoundError(f"Specified sample not found: {sample_path}")
         return sample_path
@@ -150,25 +174,56 @@ def prepare_xhat_display(xhat):
 
 
 def main():
-    args = parse_args()
-    dataset_dir = Path(args.dataset_dir)
-
-    if not dataset_dir.exists():
-        raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
+    parser = build_parser()
+    args = parser.parse_args()
+    dataset_dir = require_directory(parser, args.dataset_dir, "--dataset_dir")
 
     files = list_npz_files(dataset_dir)
+    if not files:
+        parser.error(f"--dataset_dir contains no .npz samples: {dataset_dir}")
+
+    if args.sample_name is not None:
+        sample_name = Path(args.sample_name)
+        if sample_name.name != args.sample_name:
+            parser.error("--sample_name must be a filename within --dataset_dir, not a path")
+        require_file(
+            parser,
+            str(dataset_dir / sample_name),
+            "--sample_name",
+            suffixes=(".npz",),
+        )
+    elif args.index is not None and args.index >= len(files):
+        parser.error(
+            f"--index {args.index} is out of range for {len(files)} sample(s); "
+            f"expected 0 to {len(files) - 1}"
+        )
+
     sample_path = choose_sample(files, args)
+    validate_npz_archive(parser, sample_path, "selected sample")
 
-    data = np.load(sample_path, allow_pickle=True)
-    summarize_sample(data, sample_path)
+    output_fig = None
+    if args.output_fig is not None:
+        output_fig = validate_output_file(
+            parser,
+            args.output_fig,
+            overwrite=args.overwrite,
+            option="--output_fig",
+            suffixes=(".png", ".jpg", ".jpeg", ".pdf", ".svg"),
+        )
 
-    rgb = data["rgb"] if "rgb" in data else None
-    depth = data["depth_m"] if "depth_m" in data else None
-    albedo = data["albedo"] if "albedo" in data else None
-    intensity = data["intensity"] if "intensity" in data else None
-    counts = data["counts"] if "counts" in data else None
-    xhat = data["xhat"] if "xhat" in data else None
-    x = data["x"] if "x" in data else None
+    try:
+        data = np.load(sample_path, allow_pickle=True)
+        summarize_sample(data, sample_path)
+
+        rgb = data["rgb"] if "rgb" in data else None
+        depth = data["depth_m"] if "depth_m" in data else None
+        albedo = data["albedo"] if "albedo" in data else None
+        intensity = data["intensity"] if "intensity" in data else None
+        counts = data["counts"] if "counts" in data else None
+        xhat = data["xhat"] if "xhat" in data else None
+        x = data["x"] if "x" in data else None
+    except (EOFError, KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+        parser.error(f"cannot read selected sample {sample_path}: {exc}")
 
     # Derived visualizations
     count_map = None
@@ -261,11 +316,10 @@ def main():
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
 
-    if args.save_fig is not None:
-        save_path = Path(args.save_fig)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=200, bbox_inches="tight")
-        print(f"Figure saved to: {save_path}")
+    if output_fig is not None:
+        create_output_parent(parser, output_fig, option="--output_fig")
+        plt.savefig(output_fig, dpi=200, bbox_inches="tight")
+        print(f"Figure saved to: {output_fig}")
 
     plt.show()
 

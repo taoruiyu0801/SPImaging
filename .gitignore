@@ -28,6 +28,9 @@ middlebury/processed*/
 *.tif
 *.tiff
 
+# Keep CLI validation screenshots used by the Day 13-14 acceptance record.
+!record_of_SPI/Day_13-14/异常提示截图/*.png
+
 # Keep a tiny runnable dataset in the repository.
 !example_data/
 !example_data/**

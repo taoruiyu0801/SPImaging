@@ -78,6 +78,15 @@ spad-predict --help
 spad-evaluate --help
 ```
 
+### 命令行参数与路径规则
+
+- 参数名称统一使用下划线风格。`spad-predict` 使用 `--sample_file`，`spad-verify` 使用 `--sample_name` 和 `--output_fig`，`spad-browse` 使用 `--output_dir`。
+- 旧参数 `--sample`、`--save_fig`、`--save_dir` 暂时保留为兼容别名；新脚本应使用上述规范名称。
+- 输入文件和输入目录必须已经存在，程序不会为输入路径创建空目录；错误输入会给出明确提示、无 Python traceback，并以状态码 2 退出。
+- 输出目录以及输出文件的父目录会在全部输入校验通过后自动创建。相对路径以当前工作目录为基准。
+- 已有输出默认不会被覆盖；确认需要替换同名结果或写入非空输出目录时，显式传入 `--overwrite`。
+- 各入口的默认值、合法范围和路径行为见 [`record_of_SPI/Day_13-14/参数说明表.xlsx`](record_of_SPI/Day_13-14/参数说明表.xlsx)；同目录另提供便于代码审阅和自动校验的 Markdown/CSV 版本。
+
 ## 项目结构
 
 ```text
@@ -91,7 +100,10 @@ spad-evaluate --help
 │   ├── supervised_training/        # 有监督深度重建训练入口，对应 spad-train
 │   ├── self_supervised_training/   # 自监督 SPISR 训练入口，对应 spad-train-selfsup
 │   ├── testing/                    # 检查、浏览与 checkpoint 推理，对应 spad-verify/browse/predict
+│   ├── cli.py                      # 共享 CLI 数值、路径与输出校验
 │   └── training_common/            # 训练共享的 Dataset、loss、network、checkpoint 工具
+├── tests/                          # CLI 参数、错误提示和无副作用回归测试
+├── record_of_SPI/Day_13-14/        # 参数表与代表性异常提示截图
 ├── example_data/                   # 仓库内置的少量可运行样例数据
 ├── middlebury/
 │   ├── raw/                        # Middlebury 原始数据，需自行准备
@@ -120,7 +132,7 @@ example_data/nyuv2_raw_single_random_snr/
 spad-verify \
   --dataset_dir example_data/nyuv2_raw_single_random_snr \
   --index 0 \
-  --save_fig outputs/example_verify_sample_00000.png
+  --output_fig outputs/example_verify_sample_00000.png
 ```
 
 用内置样例跑一个最小监督训练：
@@ -239,12 +251,12 @@ spad-generate \
 spad-verify \
   --dataset_dir outputs/pipeline_nyuv2_raw_single_random_snr/data \
   --index 0 \
-  --save_fig outputs/pipeline_nyuv2_raw_single_random_snr/verify_sample_00000.png
+  --output_fig outputs/pipeline_nyuv2_raw_single_random_snr/verify_sample_00000.png
 
 spad-verify \
   --dataset_dir outputs/pipeline_nyuv2_raw_single_random_snr/data \
   --index 40 \
-  --save_fig outputs/pipeline_nyuv2_raw_single_random_snr/verify_sample_00040.png
+  --output_fig outputs/pipeline_nyuv2_raw_single_random_snr/verify_sample_00040.png
 ```
 
 也可以用交互浏览器逐个检查异常样本：
@@ -312,7 +324,7 @@ spad-browse \
 spad-verify \
   --dataset_dir middlebury/processed_test \
   --index 0 \
-  --save_fig outputs/verify_sample_00000.png
+  --output_fig outputs/verify_sample_00000.png
 ```
 
 交互式浏览器：
@@ -567,7 +579,7 @@ spad-train-selfsup \
 ```bash
 spad-predict \
   --checkpoint outputs/train_simple3d/best.pt \
-  --sample middlebury/processed_test/sample_00000.npz \
+  --sample_file middlebury/processed_test/sample_00000.npz \
   --output_npz outputs/prediction/simple3d_sample_00000.npz \
   --output_fig outputs/prediction/simple3d_sample_00000.png
 ```
@@ -577,7 +589,7 @@ spad-predict \
 ```bash
 spad-predict \
   --checkpoint outputs/train_spisr_selfsup/best.pt \
-  --sample middlebury/processed_test/sample_00000.npz \
+  --sample_file middlebury/processed_test/sample_00000.npz \
   --output_npz outputs/prediction/spisr_sample_00000.npz \
   --output_fig outputs/prediction/spisr_sample_00000.png
 ```

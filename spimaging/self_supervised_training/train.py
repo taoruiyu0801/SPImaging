@@ -4,39 +4,176 @@ from __future__ import annotations
 
 import argparse
 import random
-from pathlib import Path
+
+from spimaging.cli import (
+    ArgumentParser,
+    HelpFormatter,
+    create_output_directory,
+    fraction,
+    nonnegative_float,
+    nonnegative_int,
+    positive_float,
+    positive_int,
+    random_seed,
+    require_dataset_path,
+    validate_npz_archive,
+    validate_output_directory,
+)
 
 MODEL_CHOICES = ("spisr",)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train a self-supervised SPISR model with PUKL and equivariance losses."
+def build_parser():
+    parser = ArgumentParser(
+        prog="spad-train-selfsup",
+        description="Train a self-supervised SPISR model with PUKL and equivariance losses.",
+        formatter_class=HelpFormatter,
     )
-    parser.add_argument("--dataset_dir", action="append", required=True, help="Directory containing generated .npz samples.")
-    parser.add_argument("--output_dir", default="outputs/train_spisr_selfsup", help="Directory for checkpoints.")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=1e-6)
-    parser.add_argument("--val_fraction", type=float, default=0.2)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--max_samples", type=int, default=None)
-    parser.add_argument("--model", choices=MODEL_CHOICES, default="spisr")
-    parser.add_argument("--base_channels", type=int, default=16)
-    parser.add_argument("--num_blocks", type=int, default=4)
-    parser.add_argument("--time_scale", type=int, default=2, help="Longitudinal super-resolution factor.")
-    parser.add_argument("--spatial_scale", type=int, default=2, help="Lateral super-resolution factor.")
-    parser.add_argument("--temporal_downsample", type=int, default=8, help="Create LR inputs by summing time bins.")
-    parser.add_argument("--spatial_downsample", type=int, default=2, help="Create LR inputs by summing spatial blocks.")
-    parser.add_argument("--gamma", type=float, default=0.005, help="Poisson noise parameter in the PUKL estimator.")
-    parser.add_argument("--tau", type=float, default=1e-3, help="Monte Carlo finite-difference scale for PUKL.")
-    parser.add_argument("--alpha", type=float, default=1.0, help="Equivariance loss weight.")
-    parser.add_argument("--poisson_scale", type=float, default=1.0, help="Scale used before Poisson corruption in equivariance learning.")
-    parser.add_argument("--max_shift", type=int, default=8, help="Maximum random longitudinal shift on the HR cube.")
-    parser.add_argument("--no_normalize", action="store_true", help="Disable per-sample max normalization of LR counts.")
-    return parser.parse_args()
+    parser.add_argument(
+        "--dataset_dir",
+        action="append",
+        required=True,
+        metavar="PATH",
+        help="Existing dataset directory or .npz sample file; repeat to combine multiple inputs.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        default="outputs/train_spisr_selfsup",
+        metavar="DIR",
+        help="Directory in which checkpoints are written.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow writing into a non-empty output directory.",
+    )
+    parser.add_argument("--epochs", type=positive_int, default=20, help="Number of training epochs (>= 1).")
+    parser.add_argument("--batch_size", type=positive_int, default=1, help="Samples per optimizer step (>= 1).")
+    parser.add_argument("--lr", type=positive_float, default=1e-3, help="AdamW learning rate (> 0).")
+    parser.add_argument(
+        "--weight_decay",
+        type=nonnegative_float,
+        default=1e-6,
+        help="AdamW weight-decay coefficient (>= 0).",
+    )
+    parser.add_argument(
+        "--val_fraction",
+        type=fraction,
+        default=0.2,
+        help="Fraction of samples reserved for validation (0 <= value < 1).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=random_seed,
+        default=0,
+        help="Random seed between 0 and 4294967295.",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=nonnegative_int,
+        default=0,
+        help="Number of DataLoader worker processes (>= 0).",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=positive_int,
+        default=None,
+        metavar="N",
+        help="Optional positive cap on the number of samples, useful for quick tests.",
+    )
+    parser.add_argument(
+        "--model",
+        choices=MODEL_CHOICES,
+        default="spisr",
+        help="Self-supervised reconstruction architecture.",
+    )
+    parser.add_argument(
+        "--base_channels",
+        type=positive_int,
+        default=16,
+        help="Number of base feature channels in the network (>= 1).",
+    )
+    parser.add_argument(
+        "--num_blocks",
+        type=positive_int,
+        default=4,
+        help="Number of residual processing blocks (>= 1).",
+    )
+    parser.add_argument(
+        "--time_scale",
+        type=positive_int,
+        default=2,
+        help="Longitudinal super-resolution factor (>= 1).",
+    )
+    parser.add_argument(
+        "--spatial_scale",
+        type=positive_int,
+        default=2,
+        help="Lateral super-resolution factor (>= 1).",
+    )
+    parser.add_argument(
+        "--temporal_downsample",
+        type=positive_int,
+        default=8,
+        help="Factor for summing time bins when creating LR inputs (>= 1).",
+    )
+    parser.add_argument(
+        "--spatial_downsample",
+        type=positive_int,
+        default=2,
+        help="Factor for summing spatial blocks when creating LR inputs (>= 1).",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=positive_float,
+        default=0.005,
+        help="Poisson-noise parameter in the PUKL estimator (> 0).",
+    )
+    parser.add_argument(
+        "--tau",
+        type=positive_float,
+        default=1e-3,
+        help="Monte Carlo finite-difference scale for PUKL (> 0).",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=nonnegative_float,
+        default=1.0,
+        help="Equivariance-loss weight (>= 0).",
+    )
+    parser.add_argument(
+        "--poisson_scale",
+        type=positive_float,
+        default=1.0,
+        help="Scale applied before Poisson corruption in equivariance learning (> 0).",
+    )
+    parser.add_argument(
+        "--max_shift",
+        type=nonnegative_int,
+        default=8,
+        help="Maximum absolute random longitudinal shift on the HR cube (>= 0).",
+    )
+    parser.add_argument(
+        "--no_normalize",
+        action="store_true",
+        help="Disable per-sample maximum normalization of LR counts.",
+    )
+    return parser
+
+
+def parse_args(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    for value in args.dataset_dir:
+        require_dataset_path(parser, value, "--dataset_dir")
+    validate_output_directory(
+        parser,
+        args.output_dir,
+        overwrite=args.overwrite,
+        option="--output_dir",
+    )
+    return args
 
 
 def downsample_operator(hr_cube, lr_shape):
@@ -141,9 +278,20 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    files = list_sample_files(args.dataset_dir)
+    try:
+        files = list_sample_files(args.dataset_dir)
+    except (OSError, ValueError) as exc:
+        build_parser().error(str(exc))
     if args.max_samples is not None:
         files = files[: args.max_samples]
+    input_parser = build_parser()
+    for sample_file in files:
+        validate_npz_archive(
+            input_parser,
+            sample_file,
+            "--dataset_dir sample",
+            required_keys=("counts",),
+        )
 
     train_idx, val_idx = split_indices(len(files), args.val_fraction, args.seed)
     dataset = SPISRSelfSupervisedDataset(
@@ -172,8 +320,14 @@ def main():
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_parser = build_parser()
+    output_dir = validate_output_directory(
+        output_parser,
+        args.output_dir,
+        overwrite=args.overwrite,
+        option="--output_dir",
+    )
+    output_ready = False
     best_val_loss = float("inf")
 
     print(f"Device: {device}")
@@ -194,6 +348,10 @@ def main():
             f"train loss {train_metrics['loss']:.5f} PUKL {train_metrics['pukl']:.5f} E {train_metrics['equivariance']:.5f} | "
             f"val loss {val_metrics['loss']:.5f} PUKL {val_metrics['pukl']:.5f} E {val_metrics['equivariance']:.5f}"
         )
+
+        if not output_ready:
+            create_output_directory(output_parser, output_dir, option="--output_dir")
+            output_ready = True
 
         save_training_checkpoint(
             output_dir / "last.pt",

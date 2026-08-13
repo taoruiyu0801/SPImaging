@@ -4,7 +4,21 @@ from __future__ import annotations
 
 import argparse
 import random
-from pathlib import Path
+
+from spimaging.cli import (
+    ArgumentParser,
+    HelpFormatter,
+    create_output_directory,
+    fraction,
+    nonnegative_float,
+    nonnegative_int,
+    positive_float,
+    positive_int,
+    random_seed,
+    require_dataset_path,
+    validate_npz_archive,
+    validate_output_directory,
+)
 
 MODEL_CHOICES = ("simple3d", "prsnet", "penonlocal", "stin")
 
@@ -33,29 +47,140 @@ def apply_kaiming_initialization(model):
     return initialized
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train a 3D CNN with KL loss for SPAD histogram depth reconstruction.")
-    parser.add_argument("--dataset_dir", action="append", required=True, help="Directory containing generated .npz samples. Can be passed multiple times.")
-    parser.add_argument("--output_dir", default="outputs/train_spad_3dcnn", help="Directory for checkpoints.")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=1e-5)
-    parser.add_argument("--val_fraction", type=float, default=0.2)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--max_samples", type=int, default=None, help="Optional cap for quick tests.")
-    parser.add_argument("--model", choices=MODEL_CHOICES, default="simple3d", help="3D network architecture.")
-    parser.add_argument("--base_channels", type=int, default=8)
-    parser.add_argument("--num_blocks", type=int, default=10, help="Number of residual/non-local blocks for larger models.")
-    parser.add_argument("--temporal_downsample", type=int, default=1, help="Sum neighboring time bins before feeding the 3D CNN.")
-    parser.add_argument("--target_sigma_bins", type=float, default=2.0, help="Gaussian target width in downsampled time bins.")
-    parser.add_argument("--target_source", choices=["depth", "clean"], default="depth", help="Use depth-derived Gaussian targets or transient_clean distributions when available.")
-    parser.add_argument("--no_log_counts", action="store_true", help="Disable log1p compression of counts before normalization.")
-    parser.add_argument("--tv_weight", type=float, default=0.0, help="Weight for TV loss on the predicted depth map.")
-    parser.add_argument("--early_stopping_patience", type=int, default=None, help="Stop after N validation epochs without MAE improvement.")
-    parser.add_argument("--early_stopping_min_delta", type=float, default=1e-4, help="Minimum validation MAE improvement in meters.")
-    return parser.parse_args()
+def build_parser():
+    parser = ArgumentParser(
+        prog="spad-train",
+        description="Train a 3D CNN with KL loss for SPAD histogram depth reconstruction.",
+        formatter_class=HelpFormatter,
+    )
+    parser.add_argument(
+        "--dataset_dir",
+        action="append",
+        required=True,
+        metavar="PATH",
+        help="Existing dataset directory or .npz sample file; repeat to combine multiple inputs.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        default="outputs/train_spad_3dcnn",
+        metavar="DIR",
+        help="Directory in which checkpoints are written.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow writing into a non-empty output directory.",
+    )
+    parser.add_argument("--epochs", type=positive_int, default=20, help="Number of training epochs (>= 1).")
+    parser.add_argument("--batch_size", type=positive_int, default=1, help="Samples per optimizer step (>= 1).")
+    parser.add_argument("--lr", type=positive_float, default=1e-3, help="AdamW learning rate (> 0).")
+    parser.add_argument(
+        "--weight_decay",
+        type=nonnegative_float,
+        default=1e-5,
+        help="AdamW weight-decay coefficient (>= 0).",
+    )
+    parser.add_argument(
+        "--val_fraction",
+        type=fraction,
+        default=0.2,
+        help="Fraction of samples reserved for validation (0 <= value < 1).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=random_seed,
+        default=0,
+        help="Random seed between 0 and 4294967295.",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=nonnegative_int,
+        default=0,
+        help="Number of DataLoader worker processes (>= 0).",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=positive_int,
+        default=None,
+        metavar="N",
+        help="Optional positive cap on the number of samples, useful for quick tests.",
+    )
+    parser.add_argument(
+        "--model",
+        choices=MODEL_CHOICES,
+        default="simple3d",
+        help="3D network architecture.",
+    )
+    parser.add_argument(
+        "--base_channels",
+        type=positive_int,
+        default=8,
+        help="Number of base feature channels in the network (>= 1).",
+    )
+    parser.add_argument(
+        "--num_blocks",
+        type=positive_int,
+        default=10,
+        help="Number of residual/non-local blocks for larger models (>= 1).",
+    )
+    parser.add_argument(
+        "--temporal_downsample",
+        type=positive_int,
+        default=1,
+        help="Factor for summing neighboring time bins before the 3D CNN (>= 1).",
+    )
+    parser.add_argument(
+        "--target_sigma_bins",
+        type=positive_float,
+        default=2.0,
+        help="Gaussian target width in downsampled time bins (> 0).",
+    )
+    parser.add_argument(
+        "--target_source",
+        choices=["depth", "clean"],
+        default="depth",
+        help="Training-target source: depth-derived Gaussian or transient_clean when available.",
+    )
+    parser.add_argument(
+        "--no_log_counts",
+        action="store_true",
+        help="Disable log1p compression of counts before normalization.",
+    )
+    parser.add_argument(
+        "--tv_weight",
+        type=nonnegative_float,
+        default=0.0,
+        help="Weight for TV loss on the predicted depth map (>= 0).",
+    )
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=positive_int,
+        default=None,
+        metavar="N",
+        help="Stop after N validation epochs without sufficient MAE improvement; disabled when omitted.",
+    )
+    parser.add_argument(
+        "--early_stopping_min_delta",
+        type=nonnegative_float,
+        default=1e-4,
+        help="Minimum validation-MAE improvement in meters (>= 0).",
+    )
+    return parser
+
+
+def parse_args(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    for value in args.dataset_dir:
+        require_dataset_path(parser, value, "--dataset_dir")
+    validate_output_directory(
+        parser,
+        args.output_dir,
+        overwrite=args.overwrite,
+        option="--output_dir",
+    )
+    return args
 
 
 def expected_depth_from_logits(logits, bin_size, temporal_downsample):
@@ -156,9 +281,20 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    files = list_sample_files(args.dataset_dir)
+    try:
+        files = list_sample_files(args.dataset_dir)
+    except (OSError, ValueError) as exc:
+        build_parser().error(str(exc))
     if args.max_samples is not None:
         files = files[: args.max_samples]
+    input_parser = build_parser()
+    for sample_file in files:
+        validate_npz_archive(
+            input_parser,
+            sample_file,
+            "--dataset_dir sample",
+            required_keys=("counts", "depth_m"),
+        )
 
     train_idx, val_idx = split_indices(len(files), args.val_fraction, args.seed)
     dataset = SPADHistogramDataset(
@@ -188,8 +324,14 @@ def main():
     n_kaiming_layers = apply_kaiming_initialization(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_parser = build_parser()
+    output_dir = validate_output_directory(
+        output_parser,
+        args.output_dir,
+        overwrite=args.overwrite,
+        option="--output_dir",
+    )
+    output_ready = False
     best_val_mae = float("inf")
     epochs_without_improvement = 0
     global_step = 0
@@ -247,6 +389,10 @@ def main():
             f"MAE {val_metrics['mae_m']:.6f} m"
         )
         print("-" * 55)
+
+        if not output_ready:
+            create_output_directory(output_parser, output_dir, option="--output_dir")
+            output_ready = True
 
         save_training_checkpoint(
             output_dir / "last.pt",

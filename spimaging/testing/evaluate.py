@@ -7,18 +7,68 @@ import csv
 import json
 import os
 from pathlib import Path
+import pickle
+import zipfile
 
 import numpy as np
 
+from spimaging.cli import (
+    ArgumentParser,
+    HelpFormatter,
+    create_output_directory,
+    nonnegative_int,
+    require_directory,
+    require_file,
+    validate_npz_archive,
+    validate_output_directory,
+)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate SPAD reconstruction checkpoints.")
-    parser.add_argument("--checkpoint", action="append", required=True, help="Checkpoint path. Can be passed multiple times.")
-    parser.add_argument("--label", action="append", default=None, help="Model label for each checkpoint.")
-    parser.add_argument("--dataset_dir", required=True, help="Directory containing sample_*.npz files.")
-    parser.add_argument("--output_dir", required=True, help="Directory for metrics and figures.")
-    parser.add_argument("--figure_index", type=int, default=0, help="Sample index used for the comparison figure.")
-    return parser.parse_args()
+
+def build_parser():
+    parser = ArgumentParser(
+        prog="spad-evaluate",
+        description="Evaluate one or more SPAD reconstruction checkpoints.",
+        formatter_class=HelpFormatter,
+    )
+    parser.add_argument(
+        "--checkpoint",
+        action="append",
+        required=True,
+        help="Path to a trained .pt or .pth checkpoint; repeat for multiple models.",
+    )
+    parser.add_argument(
+        "--label",
+        action="append",
+        default=None,
+        help="Display label for a checkpoint; when used, repeat once per --checkpoint.",
+    )
+    parser.add_argument(
+        "--dataset_dir",
+        required=True,
+        help="Directory containing generated sample_*.npz files.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        required=True,
+        help="Directory for metric files and the comparison figure.",
+    )
+    parser.add_argument(
+        "--figure_index",
+        type=nonnegative_int,
+        default=0,
+        metavar="INDEX",
+        help="Zero-based sample index used for the comparison figure (must exist).",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow writing into an existing non-empty output directory.",
+    )
+    return parser
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
 
 
 def list_samples(dataset_dir: Path):
@@ -127,44 +177,101 @@ def save_comparison_figure(output_path, sample_path, target, predictions):
 
 
 def main():
-    args = parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+
     labels = args.label or [Path(p).parent.name for p in args.checkpoint]
     if len(labels) != len(args.checkpoint):
-        raise ValueError("--label must be passed the same number of times as --checkpoint")
+        parser.error("--label must be passed the same number of times as --checkpoint")
 
-    import torch
+    dataset_dir = require_directory(parser, args.dataset_dir, "--dataset_dir")
+    checkpoints = [
+        require_file(
+            parser,
+            value,
+            "--checkpoint",
+            suffixes=(".pt", ".pth"),
+        )
+        for value in args.checkpoint
+    ]
+    try:
+        samples = list_samples(dataset_dir)
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
+    if args.figure_index >= len(samples):
+        parser.error(
+            f"--figure_index {args.figure_index} is out of range for "
+            f"{len(samples)} sample(s); expected 0 to {len(samples) - 1}"
+        )
+    for sample in samples:
+        validate_npz_archive(
+            parser,
+            sample,
+            "--dataset_dir sample",
+            required_keys=("counts", "depth_m"),
+        )
 
+    output_dir = validate_output_directory(
+        parser,
+        args.output_dir,
+        overwrite=args.overwrite,
+        option="--output_dir",
+    )
+    from spimaging.testing.predict import load_model
     from spimaging.training_common.device import get_torch_device
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    samples = list_samples(Path(args.dataset_dir))
     device = get_torch_device()
+    for checkpoint in checkpoints:
+        try:
+            model, _, _ = load_model(checkpoint, device)
+        except (
+            EOFError,
+            IndexError,
+            KeyError,
+            OSError,
+            RuntimeError,
+            ValueError,
+            pickle.UnpicklingError,
+        ) as exc:
+            parser.error(f"cannot load --checkpoint {checkpoint}: {exc}")
+        del model
 
     rows = []
     summary = {}
     figure_predictions = []
     figure_target = None
-    figure_sample = samples[min(max(args.figure_index, 0), len(samples) - 1)]
+    figure_sample = samples[args.figure_index]
 
-    for label, checkpoint in zip(labels, args.checkpoint):
-        per_model = []
-        for sample in samples:
-            pred, target = predict_one(checkpoint, sample, device)
-            metrics = compute_metrics(pred, target)
-            row = {"model": label, "sample": sample.name, **metrics}
-            rows.append(row)
-            per_model.append(metrics)
-            if sample == figure_sample:
-                figure_predictions.append((label, pred))
-                figure_target = target
+    try:
+        for label, checkpoint in zip(labels, checkpoints):
+            per_model = []
+            for sample in samples:
+                pred, target = predict_one(checkpoint, sample, device)
+                metrics = compute_metrics(pred, target)
+                row = {"model": label, "sample": sample.name, **metrics}
+                rows.append(row)
+                per_model.append(metrics)
+                if sample == figure_sample:
+                    figure_predictions.append((label, pred))
+                    figure_target = target
 
-        summary[label] = {
-            "n_samples": len(per_model),
-            "mae_m": float(np.mean([m["mae_m"] for m in per_model])),
-            "rmse_m": float(np.mean([m["rmse_m"] for m in per_model])),
-            "abs_rel": float(np.mean([m["abs_rel"] for m in per_model])),
-        }
+            summary[label] = {
+                "n_samples": len(per_model),
+                "mae_m": float(np.mean([m["mae_m"] for m in per_model])),
+                "rmse_m": float(np.mean([m["rmse_m"] for m in per_model])),
+                "abs_rel": float(np.mean([m["abs_rel"] for m in per_model])),
+            }
+    except (
+        EOFError,
+        IndexError,
+        KeyError,
+        OSError,
+        ValueError,
+        zipfile.BadZipFile,
+    ) as exc:
+        parser.error(f"cannot evaluate the supplied checkpoint or dataset: {exc}")
+
+    create_output_directory(parser, output_dir, option="--output_dir")
 
     with open(output_dir / "metrics_per_sample.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["model", "sample", "mae_m", "rmse_m", "abs_rel"])
