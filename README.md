@@ -19,12 +19,12 @@
 conda env create -f environment.yml
 conda activate spimaging
 python -m pip install --upgrade --force-reinstall \
+  "numpy<2" \
   "torch==2.11.0+cu130" \
   "torchvision==0.26.0+cu130" \
   "torchaudio==2.11.0+cu130" \
   --index-url https://download.pytorch.org/whl/cu130 \
   --extra-index-url https://pypi.org/simple
-python -m pip install --force-reinstall "numpy<2"
 python -m pip install deepinv
 ```
 
@@ -33,12 +33,12 @@ python -m pip install deepinv
 ```bash
 conda activate spimaging
 python -m pip install --upgrade --force-reinstall \
+  "numpy<2" \
   "torch==2.11.0+cu130" \
   "torchvision==0.26.0+cu130" \
   "torchaudio==2.11.0+cu130" \
   --index-url https://download.pytorch.org/whl/cu130 \
   --extra-index-url https://pypi.org/simple
-python -m pip install --force-reinstall "numpy<2"
 python -m pip install deepinv
 ```
 
@@ -48,6 +48,8 @@ python -m pip install deepinv
 pip install -r requirements.txt
 pip install -e .
 ```
+
+该 pip 方式只安装基础生成、检查和浏览依赖；运行训练、预测、评估或 `spad-demo` 前，还需要安装 PyTorch。最省事的方式仍是使用上面的 Conda 完整安装流程。
 
 说明：
 
