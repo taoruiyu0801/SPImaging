@@ -13,6 +13,7 @@ dependencies:
   - scikit-image
   - matplotlib
   - tqdm
+  - pytest
   - pip:
       - opencv-python
       - -e .

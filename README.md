@@ -752,6 +752,30 @@ spad-evaluate \
 | 修改自监督训练循环 | `spimaging/self_supervised_training/train.py` |
 | 修改推理输出 | `spimaging/testing/predict.py` |
 
+### 运行自动化测试
+
+使用 `environment.yml` 创建的环境已包含 pytest。完整测试会实际覆盖四类数据生成、最小训练、CPU 回退、checkpoint、预测和批量评估：
+
+```powershell
+python -m pytest -q
+```
+
+测试输出使用 pytest 的临时目录，不会写入项目的正式 `outputs/`。如果只想先做快速检查，可运行：
+
+```powershell
+python -m pytest -q tests/test_smoke.py tests/test_error_inputs_pytest.py
+```
+
+### 第二台电脑独立验收
+
+将完整项目压缩包发送给测试者。测试者解压后，在项目根目录运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/run_day27_validation.ps1
+```
+
+脚本默认建立名称带时间戳的全新 Conda 环境，安装 CPU 版 PyTorch 与 DeepInverse，依次检查公开命令、运行完整 pytest 和 `spad-demo`，并生成 `day27_result_<时间戳>/`。测试者应将该结果目录完整压缩回传。无需管理员权限，也不应复用开发电脑上的环境。
+
 ## 常见问题
 
 ### `single` 模型提示 DeepInverse 未安装
