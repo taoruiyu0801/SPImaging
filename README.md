@@ -102,6 +102,7 @@ spad-demo --help
 ├── requirements.txt                # pip 依赖列表
 ├── spimaging/
 │   ├── demo.py                     # 无界面的一键检查、训练、预测和评估入口
+│   ├── gui.py                      # 一键演示的 Tkinter 桌面界面
 │   ├── generation/                 # 数据生成：数据读取、预处理、SPAD 测量模型、spad-generate
 │   ├── supervised_training/        # 有监督深度重建训练入口，对应 spad-train
 │   ├── self_supervised_training/   # 自监督 SPISR 训练入口，对应 spad-train-selfsup
@@ -193,6 +194,18 @@ outputs/demo/
 ```
 
 已有非空输出目录默认拒绝写入。需要重跑时使用 `--overwrite`；该参数只替换 demo 管理的产物，输出目录中的无关文件会保留。四个阶段全部成功并通过产物校验后，临时 staging 结果才会发布到正式目录；失败时不会留下半成品正式输出。
+
+### GUI 一键演示
+
+使用 `environment.yml` 创建或更新环境后，可以启动轻量桌面界面：
+
+```powershell
+conda run -n spimaging python -m spimaging.gui
+```
+
+在窗口中选择数据集目录和输出目录，点击“开始演示”即可运行同一套“检查样例—最小训练—预测—评估”流程。窗口会实时显示四个阶段的进度与完整日志；成功后会读取 `demo_summary.json`，显示总耗时、样本数和 MAE、RMSE、AbsRel 指标，并可直接打开输出目录。
+
+GUI 不复制训练或推理代码，而是在后台调用现有 `spimaging.demo` 模块，因此命令行和桌面版本使用相同的输入校验、临时目录发布和失败清理机制。运行过程中窗口会阻止直接关闭，以免留下孤立的训练进程。本阶段只提供 Python GUI 启动入口，尚未生成 EXE 安装包。
 
 ### 使用预训练 checkpoint 快速演示
 
