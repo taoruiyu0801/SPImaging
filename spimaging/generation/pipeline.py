@@ -454,6 +454,9 @@ def main(argv=None, *, event_callback=None, cancel_check=None):
         )
         if selection.fallback:
             emit_event("warning", callback=event_callback, code="device_fallback", message=selection.reason)
+        print(f"Device: {selection.device}")
+        if selection.fallback:
+            print(f"Device selection: {selection.reason}")
 
     index_rows = session.index_rows
     completed_ids = session.completed_ids
@@ -683,10 +686,6 @@ def main(argv=None, *, event_callback=None, cancel_check=None):
         cleanup_completed_session(session)
     except GenerationResumeError as exc:
         parser.error(f"generated output was published but staging cleanup failed: {exc}")
-    if selection is not None:
-        print(f"Device: {selection.device}")
-        if selection.fallback:
-            print(f"Device selection: {selection.reason}")
     print("Done.")
     print(f"Saved {len(index_rows)} samples to: {final_output_dir}")
     emit_event(

@@ -98,7 +98,6 @@ def predict_one(checkpoint, sample, device):
 
     from spimaging.testing.predict import expected_depth_from_logits, load_model, match_input_time_bins
     from spimaging.training_common.dataset import SPADHistogramDataset, SPISRSelfSupervisedDataset
-    from spimaging.training_common.security import load_spad_sample
 
     model, train_args, method_family = load_model(checkpoint, device)
     temporal_downsample = int(train_args.get("temporal_downsample", 1))
@@ -108,6 +107,7 @@ def predict_one(checkpoint, sample, device):
             temporal_downsample=temporal_downsample,
             spatial_downsample=int(train_args.get("spatial_downsample", 1)),
             normalize=not bool(train_args.get("no_normalize", False)),
+            include_metadata=True,
         )
         x_key = "measurement"
     else:
@@ -133,8 +133,9 @@ def predict_one(checkpoint, sample, device):
         pred = expected_depth_from_logits(logits, bin_size, effective_downsample)
 
     pred = pred.squeeze(0).cpu().numpy().astype(np.float32)
-    raw = load_spad_sample(sample, required_keys=("counts", "depth_m"))
-    target = raw["depth_m"].astype(np.float32)
+    if "depth_m" not in item:
+        raise ValueError(f"evaluation sample has no depth_m target: {sample}")
+    target = item["depth_m"].squeeze(0).cpu().numpy().astype(np.float32)
     if pred.shape != target.shape:
         target_tensor = torch.from_numpy(target[None, None, ...]).float()
         target = (

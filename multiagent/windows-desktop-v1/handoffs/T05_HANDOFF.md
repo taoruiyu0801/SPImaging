@@ -29,7 +29,7 @@
 ## Smoke Test Result
 - Command: `conda run -n spimaging python -m pytest -q tests/test_security_resume.py tests/test_algorithm_events.py`
 - Result: Passed, `15 passed in 2.34s`.
-- Affected legacy algorithms: `tests/test_training_integration.py tests/test_prediction_evaluation_integration.py tests/test_generation_models.py` passed, `14 passed in 24.42s`.
+- Affected legacy algorithms: `tests/test_training_integration.py tests/test_prediction_evaluation_integration.py tests/test_generation_models.py` passed, `14 passed in 24.09s`.
 - T01 contract regression: `tests/test_appcore.py tests/test_worker.py` passed, `14 passed in 0.55s`.
 - Compile check: owned Python paths and tests passed `python -m compileall -q`.
 

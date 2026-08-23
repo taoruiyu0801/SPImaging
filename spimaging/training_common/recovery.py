@@ -90,7 +90,8 @@ def restore_rng_state(state: Mapping[str, object]) -> None:
         torch.set_rng_state(torch_cpu)
     torch_cuda = state.get("torch_cuda")
     if torch_cuda is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(list(torch_cuda))
+        for index, cuda_state in enumerate(list(torch_cuda)[: torch.cuda.device_count()]):
+            torch.cuda.set_rng_state(cuda_state, device=index)
 
 
 def build_resume_metadata(

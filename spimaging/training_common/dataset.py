@@ -187,12 +187,14 @@ class SPISRSelfSupervisedDataset(Dataset):
         spatial_downsample=1,
         use_log_counts=False,
         normalize=True,
+        include_metadata=False,
     ):
         self.files = [Path(p) for p in files]
         self.temporal_downsample = int(temporal_downsample)
         self.spatial_downsample = int(spatial_downsample)
         self.use_log_counts = bool(use_log_counts)
         self.normalize = bool(normalize)
+        self.include_metadata = bool(include_metadata)
 
     def __len__(self):
         return len(self.files)
@@ -211,7 +213,12 @@ class SPISRSelfSupervisedDataset(Dataset):
         measurement = counts.astype(np.float32)
         if self.normalize:
             measurement = normalize_counts(measurement, use_log=self.use_log_counts)
-        return {
+        result = {
             "measurement": torch.from_numpy(measurement[None, ...]),
             "path": str(path),
         }
+        if self.include_metadata and "bin_size" in data:
+            result["bin_size"] = torch.tensor(float(data["bin_size"]), dtype=torch.float32)
+        if self.include_metadata and "depth_m" in data:
+            result["depth_m"] = torch.from_numpy(data["depth_m"].astype(np.float32)[None, ...])
+        return result

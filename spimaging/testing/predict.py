@@ -163,8 +163,6 @@ def main():
 
     from spimaging.training_common.dataset import SPADHistogramDataset, SPISRSelfSupervisedDataset
     from spimaging.training_common.device import get_torch_device
-    from spimaging.training_common.security import UnsafeArchiveError, load_spad_sample
-
     selection = get_torch_device(
         mode=args.device,
         gpu_index=args.gpu_index,
@@ -183,6 +181,7 @@ def main():
             temporal_downsample=temporal_downsample,
             spatial_downsample=int(train_args.get("spatial_downsample", 1)),
             normalize=not bool(train_args.get("no_normalize", False)),
+            include_metadata=True,
         )
     else:
         dataset = SPADHistogramDataset(
@@ -211,11 +210,9 @@ def main():
         pred_depth_m = expected_depth_from_logits(logits, bin_size, effective_temporal_downsample)
 
     pred_depth_m = pred_depth_m.squeeze(0).cpu().numpy().astype(np.float32)
-    try:
-        raw = load_spad_sample(sample_file, required_keys=("counts",))
-    except UnsafeArchiveError as exc:
-        parser.error(f"cannot read --sample_file {sample_file}: {exc}")
-    target_depth_m = raw["depth_m"].astype(np.float32) if "depth_m" in raw else None
+    target_depth_m = None
+    if "depth_m" in item:
+        target_depth_m = item["depth_m"].squeeze(0).cpu().numpy().astype(np.float32)
 
     create_output_parent(parser, output_npz, option="--output_npz")
     save_dict = {"pred_depth_m": pred_depth_m, "sample": str(sample_file), "method_family": method_family}
