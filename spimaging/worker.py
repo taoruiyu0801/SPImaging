@@ -91,6 +91,7 @@ def _list_samples(dataset_dir: Path) -> list[Path]:
 
 def _public_demo_dataset() -> Path:
     candidates = (
+        REPOSITORY_ROOT / "public_demo" / "dataset",
         REPOSITORY_ROOT / "public_demo" / "data",
         REPOSITORY_ROOT / "public_demo",
     )
@@ -373,7 +374,7 @@ class WorkerRuntime:
             path = self.layout.checkpoints / name
             if path.is_file():
                 return path
-        public_checkpoint = REPOSITORY_ROOT / "public_demo" / "simple3d_synthetic_best.pt"
+        public_checkpoint = REPOSITORY_ROOT / "public_demo" / "checkpoint" / "simple3d_synthetic.pt"
         if public_checkpoint.is_file():
             return public_checkpoint.resolve()
         raise WorkerError("没有可用 checkpoint；请先训练或选择 checkpoint。")
