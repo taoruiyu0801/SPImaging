@@ -1,0 +1,196 @@
+name: Build Windows release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact version (for example 0.2.0-beta.1)"
+        required: true
+        default: "0.2.0-beta.1"
+        type: string
+      build_runtime:
+        description: "Build locked CPU/CUDA conda-pack assets"
+        required: true
+        default: false
+        type: boolean
+      publish:
+        description: "Publish to the matching v<version> tag after release-environment approval"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+  OUT_DIR: packaging/out
+
+jobs:
+  validate-request:
+    runs-on: windows-latest
+    steps:
+      - name: Fail closed on unsafe publish request
+        shell: pwsh
+        run: |
+          if ("${{ inputs.publish }}" -eq "true") {
+            if ("${{ github.ref }}" -ne "refs/tags/v${{ inputs.version }}") {
+              throw "Publishing requires dispatch from the exact tag refs/tags/v${{ inputs.version }}"
+            }
+            if ("${{ inputs.build_runtime }}" -ne "true") {
+              throw "Publishing requires build_runtime=true"
+            }
+          }
+
+  launcher-and-app:
+    needs: validate-request
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install launcher build tools
+        run: python -m pip install --disable-pip-version-check pyinstaller pytest
+      - name: Test safe bootstrap library
+        run: python -m pytest -q tests/test_launcher.py tests/test_release_manifest.py
+      - name: Build deterministic app and launcher assets
+        shell: pwsh
+        run: |
+          packaging/scripts/Build-AppAsset.ps1 -Version "${{ inputs.version }}" -OutputDirectory $env:OUT_DIR
+          packaging/scripts/Build-Launcher.ps1 -OutputDirectory "$env:OUT_DIR/launcher"
+      - name: Upload non-published build inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-app-launcher-${{ inputs.version }}
+          path: |
+            packaging/out/spimaging-app-*.zip*
+            packaging/out/launcher/SPImaging.exe
+          if-no-files-found: error
+
+  locked-runtimes:
+    needs: validate-request
+    if: inputs.build_runtime
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          activate-environment: build-tools
+          python-version: "3.10"
+      - name: Install build-host tools
+        shell: pwsh
+        run: conda install -y -n build-tools -c conda-forge conda-lock conda-pack
+      - name: Resolve archived locks and build conda-pack assets
+        shell: pwsh
+        run: |
+          packaging/scripts/New-RuntimeLocks.ps1
+          packaging/scripts/Build-Runtime.ps1 -Variant cpu -Version "${{ inputs.version }}" -OutputDirectory $env:OUT_DIR
+          packaging/scripts/Build-Runtime.ps1 -Variant cuda -Version "${{ inputs.version }}" -OutputDirectory $env:OUT_DIR
+      - name: Upload locked runtime candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-runtimes-${{ inputs.version }}
+          path: |
+            packaging/runtime/locks/*
+            packaging/out/spimaging-runtime-*.zip*
+          if-no-files-found: error
+
+  installer-preview:
+    needs: launcher-and-app
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-app-launcher-${{ inputs.version }}
+          path: packaging/out
+      - name: Normalize downloaded launcher location
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force packaging/out/launcher | Out-Null
+          $candidate = Get-ChildItem packaging/out -Recurse -Filter SPImaging.exe | Select-Object -First 1
+          if (-not $candidate) { throw "Downloaded launcher is missing" }
+          $target = Join-Path (Resolve-Path packaging/out/launcher).Path "SPImaging.exe"
+          if ($candidate.FullName -ne $target) {
+            Copy-Item -LiteralPath $candidate.FullName $target
+          }
+      - name: Install external Inno prerequisite
+        run: choco install innosetup --no-progress -y
+      - name: Build explicitly unsigned beta installer preview
+        shell: pwsh
+        run: packaging/scripts/Build-Installer.ps1 -Version "${{ inputs.version }}" -OutputDirectory $env:OUT_DIR
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SPImaging-Setup-unsigned-beta-${{ inputs.version }}
+          path: packaging/out/SPImaging-Setup-unsigned-beta.exe
+          if-no-files-found: error
+
+  publish:
+    needs: [launcher-and-app, locked-runtimes, installer-preview]
+    if: >-
+      inputs.publish && inputs.build_runtime &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      github.ref_name == format('v{0}', inputs.version)
+    runs-on: windows-latest
+    environment: windows-release-approval
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "windows-*-${{ inputs.version }}"
+          path: packaging/out
+          merge-multiple: true
+      - name: Require signing secret for publishing
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          SPIMAGING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          SIGNER_THUMBPRINT: ${{ secrets.WINDOWS_SIGNER_THUMBPRINT }}
+        run: |
+          if (-not $env:PFX_BASE64 -or -not $env:SPIMAGING_PFX_PASSWORD -or -not $env:SIGNER_THUMBPRINT) {
+            throw "Publishing is blocked until PFX, password, and signer-thumbprint secrets are configured."
+          }
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP/signing.pfx", [Convert]::FromBase64String($env:PFX_BASE64))
+      - name: Sign archives, launcher, create signed manifest and installer
+        shell: pwsh
+        env:
+          SPIMAGING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          SIGNER_THUMBPRINT: ${{ secrets.WINDOWS_SIGNER_THUMBPRINT }}
+        run: |
+          Get-ChildItem $env:OUT_DIR -Filter "spimaging-*.zip" | ForEach-Object {
+            packaging/scripts/Sign-Artifact.ps1 -Artifact $_.FullName -Mode DetachedCms -PfxPath "$env:RUNNER_TEMP/signing.pfx" -CertificateThumbprint $env:SIGNER_THUMBPRINT
+          }
+          packaging/scripts/New-ReleaseManifest.ps1 `
+            -Version "${{ inputs.version }}" `
+            -BaseUrl "https://github.com/${{ github.repository }}/releases/download/v${{ inputs.version }}" `
+            -OutputDirectory $env:OUT_DIR `
+            -SignerThumbprint $env:SIGNER_THUMBPRINT
+          packaging/scripts/Sign-Artifact.ps1 -Artifact "$env:OUT_DIR/launcher/SPImaging.exe" -Mode Authenticode -PfxPath "$env:RUNNER_TEMP/signing.pfx" -CertificateThumbprint $env:SIGNER_THUMBPRINT
+          packaging/scripts/Build-Installer.ps1 `
+            -Version "${{ inputs.version }}" `
+            -OutputDirectory $env:OUT_DIR `
+            -SigningPfxPath "$env:RUNNER_TEMP/signing.pfx" `
+            -CertificateThumbprint $env:SIGNER_THUMBPRINT
+      - name: Publish only after all explicit gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release view "v${{ inputs.version }}" *> $null
+          if ($LASTEXITCODE -ne 0) { throw "Create the GitHub release record manually before uploading assets." }
+          $assets = @(
+            "$env:OUT_DIR/spimaging-release-manifest.json",
+            "$env:OUT_DIR/SPImaging-Setup.exe"
+          )
+          $assets += Get-ChildItem $env:OUT_DIR -File | Where-Object {
+            $_.Name -match '^spimaging-.*\.zip\.(\d{3}|p7s)$'
+          } | ForEach-Object FullName
+          if ($assets.Count -lt 6) { throw "Expected manifest, installer, runtime/app parts, and signatures before upload." }
+          gh release upload "v${{ inputs.version }}" @assets --clobber

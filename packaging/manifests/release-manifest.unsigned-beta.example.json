@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "product": "SPImaging",
+  "release_version": "0.2.0-beta.1",
+  "channel": "beta",
+  "published_at": "2026-08-23T00:00:00Z",
+  "unsigned_beta": true,
+  "assets": [
+    {
+      "asset_id": "spimaging-runtime-cpu-0.2.0-beta.1",
+      "component": "runtime",
+      "variant": "cpu",
+      "platform": "windows-x86_64",
+      "version": "0.2.0-beta.1",
+      "archive_name": "spimaging-runtime-cpu-0.2.0-beta.1.zip",
+      "archive_format": "zip",
+      "archive_size": 1,
+      "archive_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "unpacked_size": 1,
+      "parts": [{
+        "name": "spimaging-runtime-cpu-0.2.0-beta.1.zip.001",
+        "url": "https://example.invalid/spimaging-runtime-cpu-0.2.0-beta.1.zip.001",
+        "size": 1,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }],
+      "required_paths": ["python.exe"],
+      "relocation": null,
+      "health_check": null,
+      "signature": {"kind": "none", "required": false}
+    },
+    {
+      "asset_id": "spimaging-app-universal-0.2.0-beta.1",
+      "component": "app",
+      "variant": "universal",
+      "platform": "windows-x86_64",
+      "version": "0.2.0-beta.1",
+      "archive_name": "spimaging-app-0.2.0-beta.1.zip",
+      "archive_format": "zip",
+      "archive_size": 1,
+      "archive_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "unpacked_size": 1,
+      "parts": [{
+        "name": "spimaging-app-0.2.0-beta.1.zip.001",
+        "url": "https://example.invalid/spimaging-app-0.2.0-beta.1.zip.001",
+        "size": 1,
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }],
+      "required_paths": ["spimaging/__init__.py"],
+      "relocation": null,
+      "health_check": null,
+      "signature": {"kind": "none", "required": false}
+    }
+  ],
+  "launch": {
+    "runtime_executable": "pythonw.exe",
+    "console_executable": "python.exe",
+    "app_module": "spimaging.desktop",
+    "arguments": []
+  }
+}
