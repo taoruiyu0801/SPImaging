@@ -16,8 +16,13 @@ from .errors import ManifestError
 SCHEMA_VERSION = 1
 PLATFORM = "windows-x86_64"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$" )
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
+_SEMVER_IDENTIFIER = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
+_VERSION_RE = re.compile(
+    rf"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    rf"(?:-{_SEMVER_IDENTIFIER}(?:\.{_SEMVER_IDENTIFIER})*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
 
 
 def _mapping(value: Any, field: str) -> Mapping[str, Any]:
@@ -305,8 +310,12 @@ class ReleaseManifest:
         if len({asset.asset_id.casefold() for asset in assets}) != len(assets):
             raise ManifestError("asset_id values must be unique")
         for asset in assets:
-            if asset.version != release_version:
-                raise ManifestError(f"asset {asset.asset_id} does not match release_version")
+            # The application follows the public release version, while the
+            # large CPU/CUDA runtimes are independently versioned layers.  A
+            # code-only update can therefore reuse an already installed and
+            # verified runtime without downloading it again.
+            if asset.component == "app" and asset.version != release_version:
+                raise ManifestError(f"app asset {asset.asset_id} does not match release_version")
             if asset.platform != PLATFORM:
                 raise ManifestError(f"asset {asset.asset_id} targets unsupported platform {asset.platform}")
             if not unsigned_beta and not asset.signature.required:
@@ -314,6 +323,9 @@ class ReleaseManifest:
         components = {(asset.component, asset.variant) for asset in assets}
         if ("runtime", "cpu") not in components or ("app", "universal") not in components:
             raise ManifestError("manifest requires CPU runtime and universal app assets")
+        runtime_versions = {asset.version for asset in assets if asset.component == "runtime"}
+        if len(runtime_versions) != 1:
+            raise ManifestError("CPU and CUDA runtime assets must use one shared runtime layer version")
         return cls(
             schema_version=schema_version,
             product=_text(data.get("product"), "product"),
@@ -359,6 +371,40 @@ class RuntimeSelection:
 def _version_tuple(value: str) -> tuple[int, ...]:
     parts = tuple(int(part) for part in value.split("."))
     return parts + (0,) * (4 - len(parts))
+
+
+def compare_semver(left: str, right: str) -> int:
+    """Return SemVer precedence ordering (-1, 0, 1), ignoring build metadata."""
+
+    def split(value: str) -> tuple[tuple[int, int, int], tuple[str, ...] | None]:
+        if _VERSION_RE.fullmatch(value) is None:
+            raise ManifestError(f"invalid semantic version: {value}")
+        precedence = value.split("+", 1)[0]
+        core, separator, prerelease = precedence.partition("-")
+        major, minor, patch = (int(part) for part in core.split("."))
+        return (major, minor, patch), tuple(prerelease.split(".")) if separator else None
+
+    left_core, left_pre = split(left)
+    right_core, right_pre = split(right)
+    if left_core != right_core:
+        return -1 if left_core < right_core else 1
+    if left_pre is None or right_pre is None:
+        if left_pre is right_pre:
+            return 0
+        return 1 if left_pre is None else -1
+    for left_item, right_item in zip(left_pre, right_pre):
+        if left_item == right_item:
+            continue
+        left_numeric = left_item.isdigit()
+        right_numeric = right_item.isdigit()
+        if left_numeric and right_numeric:
+            return -1 if int(left_item) < int(right_item) else 1
+        if left_numeric != right_numeric:
+            return -1 if left_numeric else 1
+        return -1 if left_item < right_item else 1
+    if len(left_pre) == len(right_pre):
+        return 0
+    return -1 if len(left_pre) < len(right_pre) else 1
 
 
 def select_runtime_asset(

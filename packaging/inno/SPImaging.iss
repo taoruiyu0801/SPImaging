@@ -48,6 +48,10 @@ SetupLogging=yes
 Source: "{#MySourceRoot}\launcher\SPImaging.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyRepoRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyRepoRoot}\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyRepoRoot}\THIRD_PARTY_LICENSES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyRepoRoot}\SBOM.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyRepoRoot}\public_demo\CC0_NOTICE.md"; DestDir: "{app}\licenses\public-demo"; Flags: ignoreversion
+Source: "{#MyRepoRoot}\public_demo\CC0-1.0.txt"; DestDir: "{app}\licenses\public-demo"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\SPImaging"; Filename: "{app}\SPImaging.exe"

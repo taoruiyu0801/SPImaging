@@ -42,6 +42,11 @@ from spimaging.generation.processing import (
     resize_rgb_depth,
     rgb_to_albedo_and_intensity,
 )
+from spimaging.generation.recovery import (
+    GenerationResumeError,
+    publish_generation_directory,
+    recover_generation_publication,
+)
 
 
 def build_parser():
@@ -177,6 +182,11 @@ def parse_args(argv=None):
 
 
 def validate_args(parser, args):
+    try:
+        recover_generation_publication(args.output_dir)
+    except GenerationResumeError as exc:
+        parser.error(f"cannot recover interrupted generation publication: {exc}")
+
     if args.middlebury_depth_max <= args.middlebury_depth_min:
         parser.error("--middlebury_depth_max must be greater than --middlebury_depth_min")
 
@@ -213,25 +223,9 @@ def validate_source_image_signatures(parser, pairs, dataset_mode):
 
 
 def publish_generated_output(parser, staging_dir, output_dir, overwrite):
-    create_output_directory(parser, output_dir)
-    existing_owned = list(output_dir.glob("sample_*.npz"))
-    index_path = output_dir / "index.csv"
-    if index_path.exists():
-        existing_owned.append(index_path)
-    generation_manifest = output_dir / "generation_manifest.json"
-    if generation_manifest.exists():
-        existing_owned.append(generation_manifest)
-
-    produced = {path.name for path in staging_dir.iterdir() if path.is_file()}
     try:
-        for source in staging_dir.iterdir():
-            if source.is_file():
-                source.replace(output_dir / source.name)
-        if overwrite:
-            for stale in existing_owned:
-                if stale.name not in produced and stale.is_file():
-                    stale.unlink()
-    except OSError as exc:
+        publish_generation_directory(staging_dir, output_dir, overwrite=overwrite)
+    except (GenerationResumeError, OSError) as exc:
         parser.error(f"cannot publish generated files to --output_dir {output_dir}: {exc}")
 
 
@@ -401,13 +395,17 @@ def main(argv=None, *, event_callback=None, cancel_check=None):
         validate_source_image_signatures(parser, pairs, args.dataset_mode)
 
     from spimaging.generation.recovery import (
-        GenerationResumeError,
-        cleanup_completed_session,
         generation_config_fingerprint,
         prepare_generation_session,
         source_fingerprint,
     )
-    from spimaging.training_common.events import cancellation_requested, emit_event
+    from spimaging.training_common.events import (
+        cancellation_requested,
+        emit_event,
+        structured_events_enabled,
+    )
+
+    disable_progress = structured_events_enabled()
 
     if args.dataset_mode == "labeled":
         total_candidates = int(images.shape[0])
@@ -490,7 +488,11 @@ def main(argv=None, *, event_callback=None, cancel_check=None):
         if args.limit is not None:
             n_samples = min(n_samples, args.limit)
 
-        for idx in tqdm(range(n_samples), desc=f"Generating SPAD dataset from labeled NYUv2 ({args.surface_model})"):
+        for idx in tqdm(
+            range(n_samples),
+            desc=f"Generating SPAD dataset from labeled NYUv2 ({args.surface_model})",
+            disable=disable_progress,
+        ):
             check_cancelled(idx)
             if idx in completed_ids:
                 continue
@@ -539,7 +541,13 @@ def main(argv=None, *, event_callback=None, cancel_check=None):
             )
 
     elif args.dataset_mode == "raw":
-        for idx, item in enumerate(tqdm(pairs, desc=f"Generating SPAD dataset from raw NYUv2 ({args.surface_model})")):
+        for idx, item in enumerate(
+            tqdm(
+                pairs,
+                desc=f"Generating SPAD dataset from raw NYUv2 ({args.surface_model})",
+                disable=disable_progress,
+            )
+        ):
             check_cancelled(idx)
             if idx in completed_ids:
                 continue
@@ -600,7 +608,13 @@ def main(argv=None, *, event_callback=None, cancel_check=None):
             )
 
     else:  # middlebury
-        for idx, item in enumerate(tqdm(pairs, desc=f"Generating SPAD dataset from Middlebury ({args.surface_model})")):
+        for idx, item in enumerate(
+            tqdm(
+                pairs,
+                desc=f"Generating SPAD dataset from Middlebury ({args.surface_model})",
+                disable=disable_progress,
+            )
+        ):
             check_cancelled(idx)
             if idx in completed_ids:
                 continue
@@ -680,12 +694,10 @@ def main(argv=None, *, event_callback=None, cancel_check=None):
         writer.writeheader()
         writer.writerows(index_rows)
 
-    session.complete()
+    # Keep the integrity-checked resumable journal until the complete staging
+    # tree has become the canonical output directory in one rename.
+    session.complete(retain_partial=True)
     publish_generated_output(parser, output_dir, final_output_dir, args.overwrite)
-    try:
-        cleanup_completed_session(session)
-    except GenerationResumeError as exc:
-        parser.error(f"generated output was published but staging cleanup failed: {exc}")
     print("Done.")
     print(f"Saved {len(index_rows)} samples to: {final_output_dir}")
     emit_event(

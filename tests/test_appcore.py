@@ -7,9 +7,10 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import zipfile
 
 from spimaging.appcore.config import RunConfig
-from spimaging.appcore.diagnostics import redact_text
+from spimaging.appcore.diagnostics import export_diagnostic_bundle, redact_text
 from spimaging.appcore.events import EventType, EventWriter, WorkerEvent
 from spimaging.appcore.history import HistoryStore
 from spimaging.appcore.specs import (
@@ -46,13 +47,53 @@ class AlgorithmSpecTests(unittest.TestCase):
         self.assertNotIn("num_blocks", stin_names)
 
     def test_quick_preset_and_bounds_are_validated(self) -> None:
-        values = validate_training_parameters("simple3d", "quick", {"base_channels": 2})
+        values = validate_training_parameters("simple3d", "quick", {})
         self.assertEqual(values["epochs"], 1)
         self.assertEqual(values["max_samples"], 2)
         self.assertEqual(values["base_channels"], 2)
+        self.assertEqual(values["temporal_downsample"], 64)
+        self.assertEqual(
+            validate_training_parameters("simple3d", "standard", {})["base_channels"],
+            8,
+        )
         with self.assertRaisesRegex(ValueError, "训练轮数"):
             validate_training_parameters("simple3d", "custom", {"epochs": 0})
+        with self.assertRaisesRegex(ValueError, "奇数"):
+            SIMULATION_ALGORITHMS["neighborhood_mix"].validate_parameters(
+                {"mix_kernel_size": 4}
+            )
+        with self.assertRaisesRegex(ValueError, "256"):
+            validate_training_parameters("simple3d", "custom", {"base_channels": 257})
+        with self.assertRaisesRegex(ValueError, "256"):
+            validate_training_parameters(
+                "simple3d", "custom", {"base_channels": 10**10000}
+            )
+        with self.assertRaisesRegex(ValueError, "64"):
+            validate_training_parameters("spisr", "custom", {"time_scale": 65})
         self.assertEqual(TRAINING_PRESETS["standard"]["epochs"], 20)
+        self.assertEqual(
+            validate_training_parameters("spisr", "standard", {})["weight_decay"],
+            1e-6,
+        )
+
+    def test_volume_defaults_defer_to_medium_and_only_show_effective_boost(self) -> None:
+        algorithm = SIMULATION_ALGORITHMS["volume_scattering"]
+        defaults = algorithm.parameter_defaults()
+        self.assertIsNone(defaults["volume_extinction_coeff"])
+        self.assertIsNone(defaults["volume_backscatter_ratio"])
+        self.assertIsNone(
+            algorithm.validate_parameters({})["volume_extinction_coeff"]
+        )
+
+        fog_names = {item.name for item in algorithm.visible_parameters({})}
+        water_names = {
+            item.name
+            for item in algorithm.visible_parameters({"volume_medium_type": "water"})
+        }
+        self.assertIn("volume_fog_front_boost", fog_names)
+        self.assertNotIn("volume_water_front_boost", fog_names)
+        self.assertIn("volume_water_front_boost", water_names)
+        self.assertNotIn("volume_fog_front_boost", water_names)
 
 
 class RunConfigTests(unittest.TestCase):
@@ -96,6 +137,58 @@ class RunConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "未知字段"):
                 RunConfig.from_dict(data)
 
+    def test_schema_types_reject_bool_float_truncation_and_stringification(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = RunConfig.new("noop", Path(temporary_directory) / "run").to_dict()
+            cases = (
+                (("schema_version",), True, "schema_version必须是整数"),
+                (("schema_version",), 1.0, "schema_version必须是整数"),
+                (("workflow",), 7, "workflow必须是文本"),
+                (("display_name",), False, "display_name必须是文本"),
+                (("generation", "enabled"), 1, "generation.enabled必须是布尔值"),
+                (("generation", "dataset_mode"), 1, "generation.dataset_mode必须是文本"),
+                (("training", "preset"), [], "training.preset必须是文本"),
+                (("evaluation", "figure_index"), 1.5, "evaluation.figure_index必须是整数"),
+                (("visualization", "sample_count"), True, "visualization.sample_count必须是整数"),
+                (("visualization", "sample_indices"), [0, 2.5], r"sample_indices\[1\]必须是整数"),
+                (("compute", "gpu_index"), "0", "compute.gpu_index必须是整数"),
+                (("compute", "preference"), None, "compute.preference必须是文本"),
+            )
+            for keys, invalid, message in cases:
+                data = json.loads(json.dumps(base))
+                target = data
+                for key in keys[:-1]:
+                    target = target[key]
+                target[keys[-1]] = invalid
+                with self.subTest(keys=keys, invalid=invalid):
+                    with self.assertRaisesRegex(ValueError, message):
+                        RunConfig.from_dict(data)
+
+    def test_full_pipeline_requires_checkpoint_when_training_is_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with self.assertRaisesRegex(ValueError, "checkpoint"):
+                RunConfig.new(
+                    "full_pipeline",
+                    root / "run",
+                    input={"dataset_paths": [str(root / "dataset")]},
+                    training={"enabled": False},
+                    prediction={"enabled": True},
+                    evaluation={"enabled": False},
+                )
+            valid = RunConfig.new(
+                "full_pipeline",
+                root / "valid",
+                input={
+                    "dataset_paths": [str(root / "dataset")],
+                    "checkpoint_paths": [str(root / "model.pt")],
+                },
+                training={"enabled": False},
+                prediction={"enabled": True},
+                evaluation={"enabled": False},
+            )
+            self.assertFalse(valid.training.enabled)
+
 
 class EventAndStorageTests(unittest.TestCase):
     def test_event_writer_sequences_and_mirrors_jsonl(self) -> None:
@@ -109,6 +202,46 @@ class EventAndStorageTests(unittest.TestCase):
             lines = path.read_text(encoding="utf-8").splitlines()
             self.assertEqual(lines, stream.getvalue().splitlines())
             self.assertEqual(WorkerEvent.from_dict(json.loads(lines[1])), second)
+
+    def test_event_writer_continues_same_run_without_rewriting_prior_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "events.jsonl"
+            first_writer = EventWriter("same-run", event_path=path)
+            first_writer.emit(EventType.STATE, {"status": "running"})
+            first_writer.emit(EventType.WARNING, {"message": "before restart"})
+            original = path.read_bytes()
+
+            second_writer = EventWriter("same-run", event_path=path)
+            continued = second_writer.emit(EventType.LOG, {"message": "after restart"})
+
+            self.assertEqual(continued.seq, 3)
+            self.assertTrue(path.read_bytes().startswith(original))
+            events = [
+                WorkerEvent.from_dict(json.loads(line))
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([event.seq for event in events], [1, 2, 3])
+
+    def test_event_writer_discards_only_truncated_tail_across_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "events.jsonl"
+            first = EventWriter("same-run", event_path=path)
+            first.emit(EventType.STATE, {"status": "running"})
+            complete_prefix = path.read_bytes()
+            with path.open("ab") as handle:
+                handle.write(b'{"schema_version":1,"run_id":"same-run"')
+
+            second = EventWriter("same-run", event_path=path)
+            self.assertEqual(second.emit(EventType.WARNING, {"message": "recovered"}).seq, 2)
+            self.assertTrue(path.read_bytes().startswith(complete_prefix))
+
+            third = EventWriter("same-run", event_path=path)
+            self.assertEqual(third.emit(EventType.LOG, {"message": "again"}).seq, 3)
+            events = [
+                WorkerEvent.from_dict(json.loads(line))
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([event.seq for event in events], [1, 2, 3])
 
     def test_run_storage_is_atomic_and_artifacts_cannot_escape(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -170,12 +303,72 @@ class HistoryAndDiagnosticsTests(unittest.TestCase):
             self.assertEqual(record.status, "succeeded")
             self.assertEqual(record.summary, {"ok": True})
 
+    def test_history_recovery_persists_interrupted_authoritative_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = RunConfig.new("noop", root / "runs" / "active")
+            storage = RunStorage(config)
+            manifest = storage.prepare()
+            manifest.set_status("running")
+            storage.write_result(manifest)
+            history = HistoryStore(root / "history.sqlite3")
+            history.upsert(config, "running")
+
+            self.assertEqual(history.mark_interrupted(), 1)
+
+            recovered = storage.load_result()
+            self.assertEqual(recovered.status, "interrupted")
+            self.assertEqual(recovered.error["category"], "UnexpectedInterruption")
+            self.assertEqual(history.list()[0].status, "interrupted")
+
     def test_diagnostics_redacts_user_and_explicit_paths(self) -> None:
         secret = Path.home() / "Private Data" / "sample.npz"
         text = f"input={secret}"
         redacted = redact_text(text, [secret.parent])
         self.assertNotIn(str(Path.home()), redacted)
         self.assertNotIn("Private Data", redacted)
+
+    def test_diagnostic_bundle_redacts_configured_paths_on_other_drives(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            run = root / "run"
+            run.mkdir()
+            (run / "run.json").write_text(
+                json.dumps(
+                    {
+                        "input": {"dataset_paths": [r"D:\Research Secret\dataset"]},
+                        "prediction": {"checkpoint": r"E:\Private Models\best.pt"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run / "logs").mkdir()
+            (run / "logs" / "worker.log").write_text(
+                r"reading D:\Research Secret\dataset\sample_00000.npz",
+                encoding="utf-8",
+            )
+            launcher = root / "launcher"
+            (launcher / "metadata").mkdir(parents=True)
+            (launcher / "metadata" / "update-check.json").write_text(
+                json.dumps({"last_check": "2026-08-24T00:00:00+08:00"}),
+                encoding="utf-8",
+            )
+
+            bundle = export_diagnostic_bundle(
+                root / "diagnostics.zip",
+                run_dir=run,
+                launcher_root=launcher,
+            )
+
+            with zipfile.ZipFile(bundle) as archive:
+                names = archive.namelist()
+                combined = "\n".join(
+                    archive.read(name).decode("utf-8") for name in names
+                )
+            self.assertNotIn("Research Secret", combined)
+            self.assertNotIn("Private Models", combined)
+            self.assertNotIn("D:\\", combined)
+            self.assertTrue(any(name.endswith("update-check.json") for name in names))
 
 
 if __name__ == "__main__":

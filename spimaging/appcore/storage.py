@@ -267,3 +267,39 @@ class RunStorage:
             raise ValueError("结果清单 run_id 与配置不一致")
         return result
 
+
+def finalize_stale_run(
+    run_dir: str | Path,
+    status: str = "interrupted",
+    *,
+    expected_run_id: str | None = None,
+    error: Mapping[str, Any] | None = None,
+) -> str:
+    """Persist a terminal state when a worker could not finish its own manifest.
+
+    Existing terminal manifests always win.  This makes the helper safe to use
+    from both the immediate process-exit handler and startup history recovery.
+    """
+
+    if status not in {"failed", "cancelled", "interrupted"}:
+        raise ValueError(f"stale run 只能结束为失败、已取消或意外中断：{status}")
+    root = Path(run_dir).expanduser().resolve()
+    config = RunConfig.load(root / "run.json")
+    configured_root = Path(config.output.run_dir).expanduser().resolve()
+    if configured_root != root:
+        raise ValueError("运行配置指向另一个运行目录")
+    if expected_run_id is not None and config.run_id != expected_run_id:
+        raise ValueError("运行目录与预期 run_id 不一致")
+    storage = RunStorage(config)
+    manifest = storage.load_result()
+    if manifest.status in {"succeeded", "failed", "cancelled", "interrupted"}:
+        return manifest.status
+    detail = error
+    if detail is None and status == "interrupted":
+        detail = {
+            "category": "UnexpectedInterruption",
+            "message": "worker 在写入终态前退出",
+        }
+    manifest.set_status(status, error=detail)
+    storage.write_result(manifest)
+    return status

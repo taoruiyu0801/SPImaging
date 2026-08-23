@@ -41,7 +41,7 @@ if ($Mode -eq "Authenticode") {
     $signature = Set-AuthenticodeSignature -LiteralPath $artifactPath -Certificate $certificate -HashAlgorithm SHA256 -TimestampServer $TimestampUrl
     if ($signature.Status -ne "Valid") { throw "Authenticode signing failed: $($signature.StatusMessage)" }
     Write-Host "Authenticode signed $artifactPath"
-    exit 0
+    return
 }
 
 Add-Type -AssemblyName System.Security

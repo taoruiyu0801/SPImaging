@@ -44,6 +44,9 @@ RANGES = {
     cli.positive_unit_interval: "0 < 值 <= 1",
     cli.parameter_index: "整数 1—10",
     cli.positive_odd_int: "正奇数",
+    cli.model_base_channels: "整数 1—256",
+    cli.model_num_blocks: "整数 1—100",
+    cli.super_resolution_scale: "整数 1—64",
 }
 
 
@@ -68,6 +71,9 @@ def format_type(action: argparse.Action) -> str:
         cli.random_seed,
         cli.parameter_index,
         cli.positive_odd_int,
+        cli.model_base_channels,
+        cli.model_num_blocks,
+        cli.super_resolution_scale,
     }:
         return "整数"
     if action.type in {

@@ -205,7 +205,23 @@ conda run -n spimaging python -m spimaging.gui
 
 在窗口中选择数据集目录和输出目录，点击“开始演示”即可运行同一套“检查样例—最小训练—预测—评估”流程。窗口会实时显示四个阶段的进度与完整日志；成功后会读取 `demo_summary.json`，显示总耗时、样本数和 MAE、RMSE、AbsRel 指标，并可直接打开输出目录。
 
-GUI 不复制训练或推理代码，而是在后台调用现有 `spimaging.demo` 模块，因此命令行和桌面版本使用相同的输入校验、临时目录发布和失败清理机制。运行过程中窗口会阻止直接关闭，以免留下孤立的训练进程。本阶段只提供 Python GUI 启动入口，尚未生成 EXE 安装包。
+GUI 不复制训练或推理代码，而是在后台调用现有 `spimaging.demo` 模块，因此命令行和桌面版本使用相同的输入校验、临时目录发布和失败清理机制。运行过程中窗口会阻止直接关闭，以免留下孤立的训练进程。这个 Tkinter 入口继续保留，适合作为旧版轻量演示；完整 Windows 工作台见下一节。
+
+### PySide6 Windows 实验工作台（0.2.0-beta.1）
+
+Windows 10/11 x64 公开测试版提供中文 PySide6 工作台，源码环境可直接启动：
+
+```powershell
+python -m spimaging.desktop
+```
+
+工作台包含首页、实验配置、运行监控、结果画廊、历史恢复和设置六个页面。仿真模型与重建模型分开选择，参数表单由共享算法注册表生成；训练 worker 在独立进程中运行，按批次和 epoch 输出结构化进度，支持安全取消和兼容 checkpoint 恢复。每次实验都有独立运行目录，保存 `run.json`、`events.jsonl`、日志、checkpoint、指标、画廊和 `result_manifest.json`。
+
+Windows 安装候选通过 `packaging/scripts/Build-Installer.ps1` 生成。安装器按当前用户写入 `%LOCALAPPDATA%\Programs\SPImaging`，不修改 `PATH`，也不要求管理员权限。安装后的轻量 `SPImaging.exe` 会从 GitHub Releases 获取经过锁定和哈希校验的私有 CPU/CUDA 运行时与应用包；终端用户不需要预装 Python 或 Conda。检测到兼容 NVIDIA 驱动时优先使用 CUDA，驱动不兼容或 CUDA 健康检查失败时回退 CPU。首次环境就绪后可以离线启动已验证版本。
+
+注意：仓库里的本机构建产物是 `unsigned beta`。Windows SmartScreen 可能显示未知发布者提示；取得 Authenticode 证书并完成签名发布前，不应把它称为正式签名版。启动器只有在对应版本的 CPU/CUDA 运行时、应用包和发布清单已经上传到 GitHub Releases 后，才能在一台全新电脑上完成首次联网部署。详细构建和发布边界见 [`packaging/README.md`](packaging/README.md)。
+
+公开安装包只包含 `public_demo/` 下的 4 个确定性 CC0 合成样本和配套 Simple3D checkpoint，不包含 `example_data/` 或 `demo_checkpoint/` 中的 NYUv2 衍生资产。软件不会自动下载 NYUv2/Middlebury 原始数据，也不会上传用户数据。
 
 ### 使用预训练 checkpoint 快速演示
 

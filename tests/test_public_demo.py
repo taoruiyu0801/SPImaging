@@ -180,7 +180,10 @@ def test_checkpoint_recipe_reproduces_in_locked_runtime(
     tmp_path: Path,
     manifest: dict[str, object],
 ) -> None:
-    pytest.importorskip("torch")
+    torch = pytest.importorskip("torch")
+    locked_torch = manifest["checkpoint"]["recipe"]["torch_version"]
+    if torch.__version__ != locked_torch:
+        pytest.skip(f"exact checkpoint bytes require locked torch {locked_torch}")
     reproduced_root = tmp_path / "full reproduction"
     reproduced_manifest_path = generator.generate(reproduced_root)
     generator.verify(reproduced_root)

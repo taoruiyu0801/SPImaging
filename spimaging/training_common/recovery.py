@@ -86,12 +86,26 @@ def restore_rng_state(state: Mapping[str, object]) -> None:
             )
         )
     torch_cpu = state.get("torch_cpu")
-    if torch_cpu is not None:
-        torch.set_rng_state(torch_cpu)
+    if not isinstance(torch_cpu, torch.Tensor):
+        raise IncompatibleResumeError("checkpoint CPU RNG state is missing or invalid")
+    if torch_cpu.dtype is not torch.uint8 or torch_cpu.ndim != 1:
+        raise IncompatibleResumeError("checkpoint CPU RNG tensor has an invalid shape or dtype")
+    torch.set_rng_state(torch_cpu.detach().cpu().contiguous())
     torch_cuda = state.get("torch_cuda")
     if torch_cuda is not None and torch.cuda.is_available():
-        for index, cuda_state in enumerate(list(torch_cuda)[: torch.cuda.device_count()]):
-            torch.cuda.set_rng_state(cuda_state, device=index)
+        if not isinstance(torch_cuda, (list, tuple)):
+            raise IncompatibleResumeError("checkpoint CUDA RNG state is invalid")
+        for index, cuda_state in enumerate(torch_cuda[: torch.cuda.device_count()]):
+            if (
+                not isinstance(cuda_state, torch.Tensor)
+                or cuda_state.dtype is not torch.uint8
+                or cuda_state.ndim != 1
+            ):
+                raise IncompatibleResumeError("checkpoint CUDA RNG tensor is invalid")
+            torch.cuda.set_rng_state(
+                cuda_state.detach().cpu().contiguous(),
+                device=index,
+            )
 
 
 def build_resume_metadata(
@@ -169,7 +183,12 @@ def restore_checkpoint_state(model, optimizer, checkpoint: Mapping[str, object])
     rng_state = metadata.get("rng_state")
     if not isinstance(rng_state, Mapping):
         raise IncompatibleResumeError("checkpoint RNG state is missing or invalid")
-    restore_rng_state(rng_state)
+    try:
+        restore_rng_state(rng_state)
+    except IncompatibleResumeError:
+        raise
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise IncompatibleResumeError(f"checkpoint RNG state is incompatible: {exc}") from exc
     return metadata
 
 

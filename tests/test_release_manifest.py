@@ -9,7 +9,7 @@ import runpy
 import unittest
 
 from launcher.errors import ManifestError
-from launcher.manifest import NvidiaCapability, ReleaseManifest, select_runtime_asset
+from launcher.manifest import NvidiaCapability, ReleaseManifest, compare_semver, select_runtime_asset
 
 
 _HASH_A = "a" * 64
@@ -120,6 +120,31 @@ class ReleaseManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ManifestError, "requires CPU runtime"):
             ReleaseManifest.from_dict(source)
 
+    def test_runtime_layer_version_is_independent_but_app_tracks_release(self) -> None:
+        source = valid_manifest_dict(cuda=False)
+        runtime = source["assets"][0]  # type: ignore[index]
+        runtime["version"] = "0.2.0-runtime.1"
+        runtime["asset_id"] = "spimaging-runtime-cpu-0.2.0-runtime.1"
+        manifest = ReleaseManifest.from_dict(source)
+        self.assertEqual(manifest.asset("runtime", "cpu").version, "0.2.0-runtime.1")
+
+        app_mismatch = deepcopy(source)
+        app_mismatch["assets"][1]["version"] = "0.2.0-beta.2"  # type: ignore[index]
+        with self.assertRaisesRegex(ManifestError, "app asset.*release_version"):
+            ReleaseManifest.from_dict(app_mismatch)
+
+    def test_versions_use_strict_semver(self) -> None:
+        for invalid in ("01.2.3", "1.02.3", "1.2", "1.2.3-01", "1.2.3-"):
+            source = valid_manifest_dict(cuda=False)
+            source["release_version"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaises(ManifestError):
+                ReleaseManifest.from_dict(source)
+
+    def test_semver_precedence_supports_prerelease_and_ignores_build_metadata(self) -> None:
+        self.assertLess(compare_semver("0.2.0-beta.1", "0.2.0-beta.2"), 0)
+        self.assertLess(compare_semver("0.2.0-beta.2", "0.2.0"), 0)
+        self.assertEqual(compare_semver("0.2.0+build.1", "0.2.0+build.2"), 0)
+
 
 class RuntimeSelectionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -185,6 +210,55 @@ class RuntimePackagingPolicyTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("import PySide6,deepinv", source)
         self.assertIn("torch.cuda.is_available()", source)
+        self.assertIn('"--runtime-version"', source)
+
+    def test_release_workflow_uses_env_validated_versions_and_manifest_signature(self) -> None:
+        workflow = (
+            Path(__file__).resolve().parents[1]
+            / ".github"
+            / "workflows"
+            / "windows-release-candidate.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("$semver =", workflow)
+        self.assertIn("-Version $env:RELEASE_VERSION", workflow)
+        self.assertIn("-RuntimeVersion $env:RUNTIME_VERSION", workflow)
+        self.assertNotIn('-Version "${{ inputs.version }}"', workflow)
+        self.assertIn("spimaging-release-manifest.json.p7s", workflow)
+        self.assertIn("choco install innosetup", workflow)
+        self.assertIn("Refusing nested packaging/out/out", workflow)
+        self.assertIn("publish_unsigned_beta", workflow)
+        self.assertIn("windows-unsigned-beta-approval", workflow)
+        self.assertIn("Unsigned beta must never publish the stable installer filename", workflow)
+        self.assertIn('$channelTag = "windows-beta"', workflow)
+
+    def test_launcher_combined_health_uses_selected_runtime_and_desktop_smoke(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1] / "launcher" / "bootstrap.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"-m", manifest.launch.app_module, "--smoke-test"', source)
+        self.assertIn("activate_many(requests, final_health_check=combined)", source)
+
+    def test_installer_includes_public_compliance_and_cc0_legal_texts(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1] / "packaging" / "inno" / "SPImaging.iss"
+        ).read_text(encoding="utf-8")
+        for required in (
+            "THIRD_PARTY_LICENSES.md",
+            "SBOM.md",
+            "public_demo\\CC0_NOTICE.md",
+            "public_demo\\CC0-1.0.txt",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, source)
+        build_script = (
+            Path(__file__).resolve().parents[1]
+            / "packaging"
+            / "scripts"
+            / "Build-Installer.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Missing installer legal/compliance input", build_script)
+        for required in ("THIRD_PARTY_LICENSES.md", "SBOM.md", "CC0_NOTICE.md", "CC0-1.0.txt"):
+            self.assertIn(required, build_script)
 
 
 if __name__ == "__main__":

@@ -7,19 +7,19 @@
   "unsigned_beta": true,
   "assets": [
     {
-      "asset_id": "spimaging-runtime-cpu-0.2.0-beta.1",
+      "asset_id": "spimaging-runtime-cpu-0.2.0-runtime.1",
       "component": "runtime",
       "variant": "cpu",
       "platform": "windows-x86_64",
-      "version": "0.2.0-beta.1",
-      "archive_name": "spimaging-runtime-cpu-0.2.0-beta.1.zip",
+      "version": "0.2.0-runtime.1",
+      "archive_name": "spimaging-runtime-cpu-0.2.0-runtime.1.zip",
       "archive_format": "zip",
       "archive_size": 1,
       "archive_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "unpacked_size": 1,
       "parts": [{
-        "name": "spimaging-runtime-cpu-0.2.0-beta.1.zip.001",
-        "url": "https://example.invalid/spimaging-runtime-cpu-0.2.0-beta.1.zip.001",
+        "name": "spimaging-runtime-cpu-0.2.0-runtime.1.zip.001",
+        "url": "https://example.invalid/spimaging-runtime-cpu-0.2.0-runtime.1.zip.001",
         "size": 1,
         "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       }],

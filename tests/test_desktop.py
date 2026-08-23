@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtCore import QEventLoop, QProcess, QTimer
 from PySide6.QtWidgets import QApplication
 
 from spimaging.appcore.config import RunConfig
@@ -15,6 +16,7 @@ from spimaging.desktop.models import (
     ApplicationPaths,
     DesktopSettings,
     PublicDemoAssets,
+    RunProgressState,
     SettingsStore,
 )
 from spimaging.desktop.pages import ExperimentPage, ResultsPage
@@ -90,6 +92,29 @@ def test_parameter_form_advanced_controls_are_collapsible(qapp) -> None:
     assert form.values()["epochs"] == 1
 
 
+def test_nullable_volume_defaults_and_medium_visibility(qapp) -> None:
+    from PySide6.QtWidgets import QComboBox, QDoubleSpinBox
+
+    from spimaging.desktop.models import ParameterFormState
+
+    form = DynamicParameterForm(ParameterFormState("simulation", "volume_scattering"))
+    extinction = form.controls["volume_extinction_coeff"]
+    assert isinstance(extinction, QDoubleSpinBox)
+    assert extinction.specialValueText() == "使用介质默认值"
+    assert form.values()["volume_extinction_coeff"] is None
+    extinction.setValue(extinction.minimum() + extinction.singleStep())
+    assert form.values()["volume_extinction_coeff"] == pytest.approx(0.0)
+    extinction.setValue(extinction.minimum())
+    assert form.controls["volume_water_front_boost"].isHidden()
+    assert not form.controls["volume_fog_front_boost"].isHidden()
+
+    medium = form.controls["volume_medium_type"]
+    assert isinstance(medium, QComboBox)
+    medium.setCurrentText("water")
+    assert not form.controls["volume_water_front_boost"].isHidden()
+    assert form.controls["volume_fog_front_boost"].isHidden()
+
+
 def test_public_sample_inspector_constructs_offscreen(qapp) -> None:
     demo = PublicDemoAssets.discover()
     dialog = SampleInspectorDialog(demo.samples[0])
@@ -133,11 +158,14 @@ def test_results_page_opens_manifest_and_renders_gallery(qapp, tmp_path: Path) -
     assert page.gallery_layout.count() >= 2  # one card plus stretch
 
 
-def test_pythonw_is_normalized_to_console_python(tmp_path: Path) -> None:
+def test_worker_python_prefers_windowed_interpreter_on_windows(tmp_path: Path) -> None:
     pythonw = tmp_path / "pythonw.exe"
-    assert normalize_worker_python(pythonw) == str(tmp_path / "python.exe")
     python = tmp_path / "python.exe"
-    assert normalize_worker_python(python) == str(python)
+    pythonw.touch()
+    python.touch()
+    assert normalize_worker_python(pythonw) == str(pythonw)
+    expected = pythonw if os.name == "nt" else python
+    assert normalize_worker_python(python) == str(expected)
 
 
 def test_controller_reports_malformed_protocol_line(qapp) -> None:
@@ -159,6 +187,8 @@ def test_controller_executes_noop_worker_via_qprocess(qapp, tmp_path: Path) -> N
         output={"history_db": str(tmp_path / "history.sqlite3")},
     )
     controller = WorkerController()
+    if os.name == "nt" and Path(sys.executable).with_name("pythonw.exe").is_file():
+        assert Path(controller.python_executable).name.lower() == "pythonw.exe"
     completed: list[tuple[str, int]] = []
     loop = QEventLoop()
 
@@ -181,3 +211,30 @@ def test_controller_executes_noop_worker_via_qprocess(qapp, tmp_path: Path) -> N
     assert controller.progress.percent == 100
     assert (run_dir / "events.jsonl").is_file()
     assert (run_dir / "result_manifest.json").is_file()
+
+
+def test_controller_forced_cancel_persists_manifest_and_history(qapp, tmp_path: Path) -> None:
+    from spimaging.appcore.history import HistoryStore
+    from spimaging.appcore.storage import RunStorage
+
+    run_dir = tmp_path / "cancelled"
+    history_path = tmp_path / "history.sqlite3"
+    config = RunConfig.new(
+        "noop",
+        run_dir,
+        output={"history_db": str(history_path)},
+    )
+    storage = RunStorage(config)
+    manifest = storage.prepare()
+    manifest.set_status("running")
+    storage.write_result(manifest)
+    HistoryStore(history_path).upsert(config, "running")
+    controller = WorkerController()
+    controller._config = config
+    controller._progress = RunProgressState(config.run_id, status="running")
+    controller._cancel_requested = True
+
+    controller._on_finished(130, QProcess.ExitStatus.CrashExit)
+
+    assert storage.load_result().status == "cancelled"
+    assert HistoryStore(history_path).list()[0].status == "cancelled"

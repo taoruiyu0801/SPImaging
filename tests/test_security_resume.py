@@ -25,6 +25,7 @@ from spimaging.training_common.recovery import (
     build_resume_metadata,
     dataset_fingerprint,
     load_and_validate_resume,
+    restore_rng_state,
 )
 from spimaging.training_common.security import (
     ArchiveLimits,
@@ -183,6 +184,29 @@ def test_resume_metadata_validates_dataset_signature_and_epoch_direction(tmp_pat
             signature=signature,
             requested_epochs=3,
         )
+
+
+def test_supervised_resume_signature_includes_early_stopping_policy() -> None:
+    from spimaging.supervised_training.train import SUPERVISED_RESUME_SIGNATURE_FIELDS
+
+    assert "early_stopping_patience" in SUPERVISED_RESUME_SIGNATURE_FIELDS
+    assert "early_stopping_min_delta" in SUPERVISED_RESUME_SIGNATURE_FIELDS
+
+
+def test_rng_restore_forces_tensor_state_to_cpu_and_rejects_invalid_values(monkeypatch) -> None:
+    import torch
+
+    captured = []
+    state = torch.get_rng_state()
+    monkeypatch.setattr(torch, "set_rng_state", lambda value: captured.append(value))
+
+    restore_rng_state({"torch_cpu": state})
+
+    assert len(captured) == 1
+    assert captured[0].device.type == "cpu"
+    assert captured[0].dtype == torch.uint8
+    with pytest.raises(IncompatibleResumeError, match="CPU RNG"):
+        restore_rng_state({"torch_cpu": [1, 2, 3]})
 
 
 def test_training_history_writes_jsonl_and_csv(tmp_path: Path) -> None:

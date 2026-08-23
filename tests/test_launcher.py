@@ -7,22 +7,33 @@ from dataclasses import replace
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 from launcher.activation import ActivationManager
 from launcher.app import (
+    DEFAULT_BETA_MANIFEST_URL,
+    _is_update,
     _updates_disabled,
     build_parser as build_launcher_parser,
     load_desktop_preferences,
     runtime_preference,
 )
 from launcher.archive import safe_extract_zip
-from launcher.bootstrap import Provisioner
-from launcher.download import DownloadResponse, download_asset, download_part, sha256_file
+from launcher.bootstrap import ProvisionResult, Provisioner
+from launcher.download import (
+    DownloadResponse,
+    LocalDirectoryTransport,
+    download_asset,
+    download_part,
+    sha256_file,
+)
 from launcher.errors import DownloadError, ExtractionError, HealthCheckError, LauncherError, SignatureError
+from launcher.locking import InterProcessLock
 from launcher.manifest import (
     AssetPart,
     HealthCheck,
@@ -31,7 +42,9 @@ from launcher.manifest import (
     ReleaseAsset,
     ReleaseManifest,
     SignatureRequirement,
+    manifest_to_dict,
 )
+from launcher.signing import ManifestTrustPolicy
 from launcher.update import ManifestCache
 
 
@@ -54,6 +67,10 @@ def make_zip(entries: dict[str, bytes]) -> bytes:
         for name, content in entries.items():
             archive.writestr(name, content)
     return stream.getvalue()
+
+
+def noop_desktop_smoke(_runtime: Path, _app: Path, _manifest: ReleaseManifest) -> object:
+    return object()
 
 
 def asset_for_bytes(
@@ -87,6 +104,25 @@ def asset_for_bytes(
 
 
 class DownloadTests(unittest.TestCase):
+    def test_local_directory_transport_supports_verified_offline_resume(self) -> None:
+        content = b"offline-runtime" * 128
+        part = AssetPart(
+            "runtime.001",
+            "https://example.invalid/releases/runtime.001",
+            len(content),
+            hashlib.sha256(content).hexdigest(),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / part.name).write_bytes(content)
+            destination = root / "cache" / part.name
+            destination.parent.mkdir()
+            destination.with_name(destination.name + ".part").write_bytes(content[:31])
+
+            result = download_part(part, destination, LocalDirectoryTransport(root), chunk_size=17)
+
+            self.assertEqual(result.read_bytes(), content)
+
     def test_resumes_partial_download_and_validates_hash(self) -> None:
         content = b"verified release bytes" * 100
         digest = hashlib.sha256(content).hexdigest()
@@ -146,6 +182,44 @@ class DownloadTests(unittest.TestCase):
             with self.assertRaises(SignatureError):
                 download_asset(asset, Path(temporary), MemoryTransport({asset.parts[0].url: archive}))
 
+    def test_invalid_complete_partial_restarts_at_zero_instead_of_looping_on_416(self) -> None:
+        content = b"correct content"
+        part = AssetPart(
+            "runtime.001",
+            "https://example.invalid/complete-partial",
+            len(content),
+            hashlib.sha256(content).hexdigest(),
+        )
+        transport = MemoryTransport({part.url: content})
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / part.name
+            destination.with_name(part.name + ".part").write_bytes(b"x" * len(content))
+            self.assertEqual(download_part(part, destination, transport).read_bytes(), content)
+            self.assertEqual(transport.starts, [(part.url, 0)])
+
+    def test_http_416_discards_stale_partial_and_retries_once_from_zero(self) -> None:
+        content = b"0123456789"
+        part = AssetPart(
+            "runtime.001",
+            "https://example.invalid/range-416",
+            len(content),
+            hashlib.sha256(content).hexdigest(),
+        )
+
+        class Range416ThenSuccess(MemoryTransport):
+            def open(self, url: str, start: int = 0) -> DownloadResponse:
+                self.starts.append((url, start))
+                if start:
+                    return DownloadResponse(io.BytesIO(), 416, {})
+                return DownloadResponse(io.BytesIO(self.content[url]), 200, {})
+
+        transport = Range416ThenSuccess({part.url: content})
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / part.name
+            destination.with_name(part.name + ".part").write_bytes(content[:4])
+            self.assertEqual(download_part(part, destination, transport).read_bytes(), content)
+            self.assertEqual(transport.starts, [(part.url, 4), (part.url, 0)])
+
 
 class ExtractionTests(unittest.TestCase):
     def test_extracts_regular_files(self) -> None:
@@ -181,13 +255,14 @@ class ExtractionTests(unittest.TestCase):
                 safe_extract_zip(archive, root / "staging", max_unpacked_size=100)
 
     def test_rejects_windows_device_names(self) -> None:
-        content = make_zip({"folder/NUL.txt": b"unsafe"})
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            archive = root / "device.zip"
-            archive.write_bytes(content)
-            with self.assertRaisesRegex(ExtractionError, "Windows"):
-                safe_extract_zip(archive, root / "staging", max_unpacked_size=1024)
+        for name in ("NUL.txt", "CONIN$", "CONOUT$.log", "COM¹.txt", "LPT³"):
+            content = make_zip({f"folder/{name}": b"unsafe"})
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                archive = root / "device.zip"
+                archive.write_bytes(content)
+                with self.assertRaisesRegex(ExtractionError, "Windows"):
+                    safe_extract_zip(archive, root / "staging", max_unpacked_size=1024)
 
 
 class ActivationTests(unittest.TestCase):
@@ -264,7 +339,9 @@ class ProvisioningTests(unittest.TestCase):
         )
         transport = MemoryTransport({runtime.parts[0].url: runtime_zip, app.parts[0].url: app_zip})
         with tempfile.TemporaryDirectory() as temporary:
-            result = Provisioner(Path(temporary) / "install", transport).provision(
+            result = Provisioner(
+                Path(temporary) / "install", transport, desktop_smoke=noop_desktop_smoke
+            ).provision(
                 manifest, "cpu", NvidiaCapability(False)
             )
             self.assertEqual((result.runtime_path / "python.exe").read_bytes(), b"private runtime")
@@ -316,7 +393,10 @@ class ProvisioningTests(unittest.TestCase):
         transport = MemoryTransport({runtime.parts[0].url: runtime_zip, app.parts[0].url: app_zip})
         with tempfile.TemporaryDirectory() as temporary:
             result = Provisioner(
-                Path(temporary) / "install", transport, health_runner=runner  # type: ignore[arg-type]
+                Path(temporary) / "install",
+                transport,
+                health_runner=runner,  # type: ignore[arg-type]
+                desktop_smoke=noop_desktop_smoke,
             ).provision(manifest, "cpu", NvidiaCapability(False))
             runtime_calls = [call for call in runner.calls if call[1] is not None]
             self.assertEqual([call[1] for call in runtime_calls], ["Scripts/conda-unpack.exe", "python.exe"])
@@ -369,10 +449,123 @@ class ProvisioningTests(unittest.TestCase):
                 Path(temporary) / "install",
                 MemoryTransport(content),
                 health_runner=FailingCudaRunner(),  # type: ignore[arg-type]
+                desktop_smoke=noop_desktop_smoke,
             ).provision(manifest, "auto", NvidiaCapability(True, "551.0"))
             self.assertEqual(result.runtime_variant, "cpu")
             self.assertTrue(result.fallback)
             self.assertIn("CUDA 自检失败", result.reason)
+
+    def test_app_update_reuses_independently_versioned_runtime(self) -> None:
+        runtime_zip = make_zip({"python.exe": b"shared runtime"})
+        app_v1_zip = make_zip({"spimaging/__init__.py": b"version = 1\n"})
+        app_v2_zip = make_zip({"spimaging/__init__.py": b"version = 2\n"})
+        runtime = replace(
+            asset_for_bytes(runtime_zip, url="https://example.invalid/shared-runtime"),
+            asset_id="runtime-cpu-0.2.0-runtime.1",
+            version="0.2.0-runtime.1",
+        )
+        app_v1 = asset_for_bytes(
+            app_v1_zip,
+            asset_id="app-0.2.0-beta.1",
+            component="app",
+            variant="universal",
+            required_path="spimaging/__init__.py",
+            url="https://example.invalid/app-v1",
+        )
+        app_v2 = replace(
+            asset_for_bytes(
+                app_v2_zip,
+                asset_id="app-0.2.0-beta.2",
+                component="app",
+                variant="universal",
+                required_path="spimaging/__init__.py",
+                url="https://example.invalid/app-v2",
+            ),
+            version="0.2.0-beta.2",
+        )
+        launch = LaunchSpec("pythonw.exe", "python.exe", "spimaging.desktop", ())
+        first = ReleaseManifest(1, "SPImaging", "0.2.0-beta.1", "beta", "2026-08-23T00:00:00Z", True, (runtime, app_v1), launch)
+        second = ReleaseManifest(1, "SPImaging", "0.2.0-beta.2", "beta", "2026-08-24T00:00:00Z", True, (runtime, app_v2), launch)
+        transport = MemoryTransport(
+            {
+                runtime.parts[0].url: runtime_zip,
+                app_v1.parts[0].url: app_v1_zip,
+                app_v2.parts[0].url: app_v2_zip,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = Provisioner(
+                Path(temporary) / "install",
+                transport,
+                desktop_smoke=noop_desktop_smoke,
+            )
+            first_result = provisioner.provision(first, "cpu", NvidiaCapability(False))
+            second_result = provisioner.provision(second, "cpu", NvidiaCapability(False))
+            self.assertEqual(first_result.runtime_path, second_result.runtime_path)
+            self.assertEqual(
+                [url for url, _start in transport.starts].count(runtime.parts[0].url),
+                1,
+            )
+            self.assertEqual((second_result.app_path / "spimaging" / "__init__.py").read_bytes(), b"version = 2\n")
+
+    def test_combined_smoke_failure_restores_both_active_components(self) -> None:
+        runtime_v1_zip = make_zip({"python.exe": b"runtime one"})
+        app_v1_zip = make_zip({"spimaging/__init__.py": b"app one"})
+        runtime_v2_zip = make_zip({"python.exe": b"runtime two"})
+        app_v2_zip = make_zip({"spimaging/__init__.py": b"app two"})
+        runtime_v1 = asset_for_bytes(runtime_v1_zip, asset_id="runtime-v1", url="https://example.invalid/runtime-v1")
+        app_v1 = asset_for_bytes(app_v1_zip, asset_id="app-v1", component="app", variant="universal", required_path="spimaging/__init__.py", url="https://example.invalid/app-v1-transaction")
+        runtime_v2 = replace(asset_for_bytes(runtime_v2_zip, asset_id="runtime-v2", url="https://example.invalid/runtime-v2"), version="0.2.0-beta.2")
+        app_v2 = replace(asset_for_bytes(app_v2_zip, asset_id="app-v2", component="app", variant="universal", required_path="spimaging/__init__.py", url="https://example.invalid/app-v2-transaction"), version="0.2.0-beta.2")
+        launch = LaunchSpec("pythonw.exe", "python.exe", "spimaging.desktop", ())
+        first = ReleaseManifest(1, "SPImaging", "0.2.0-beta.1", "beta", "2026-08-23T00:00:00Z", True, (runtime_v1, app_v1), launch)
+        second = ReleaseManifest(1, "SPImaging", "0.2.0-beta.2", "beta", "2026-08-24T00:00:00Z", True, (runtime_v2, app_v2), launch)
+        content = {
+            runtime_v1.parts[0].url: runtime_v1_zip,
+            app_v1.parts[0].url: app_v1_zip,
+            runtime_v2.parts[0].url: runtime_v2_zip,
+            app_v2.parts[0].url: app_v2_zip,
+        }
+
+        def smoke(_runtime: Path, _app: Path, manifest: ReleaseManifest) -> object:
+            if manifest.release_version == "0.2.0-beta.2":
+                raise HealthCheckError("app import failed")
+            return object()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = Provisioner(Path(temporary) / "install", MemoryTransport(content), desktop_smoke=smoke)
+            first_result = provisioner.provision(first, "cpu", NvidiaCapability(False))
+            before = provisioner.manager.snapshot_state().state
+            with self.assertRaisesRegex(HealthCheckError, "app import failed"):
+                provisioner.provision(second, "cpu", NvidiaCapability(False))
+            self.assertEqual(provisioner.manager.snapshot_state().state, before)
+            self.assertEqual(provisioner.manager.active_path("runtime"), first_result.runtime_path)
+            self.assertEqual(provisioner.manager.active_path("app"), first_result.app_path)
+
+    def test_disk_preflight_checks_cache_and_install_volumes_before_download(self) -> None:
+        runtime_zip = make_zip({"python.exe": b"runtime"})
+        app_zip = make_zip({"spimaging/__init__.py": b"app"})
+        runtime = asset_for_bytes(runtime_zip, url="https://example.invalid/preflight-runtime")
+        app = asset_for_bytes(app_zip, asset_id="preflight-app", component="app", variant="universal", required_path="spimaging/__init__.py", url="https://example.invalid/preflight-app")
+        manifest = ReleaseManifest(1, "SPImaging", "0.2.0-beta.1", "beta", "2026-08-23T00:00:00Z", True, (runtime, app), LaunchSpec("pythonw.exe", "python.exe", "spimaging.desktop", ()))
+        transport = MemoryTransport({runtime.parts[0].url: runtime_zip, app.parts[0].url: app_zip})
+        usage = type("Usage", (), {})
+        with tempfile.TemporaryDirectory() as temporary:
+            provisioner = Provisioner(Path(temporary) / "install", transport, desktop_smoke=noop_desktop_smoke)
+            with patch("launcher.bootstrap.shutil.disk_usage", return_value=usage()) as mocked:
+                mocked.return_value.free = 1
+                with self.assertRaisesRegex(DownloadError, "download cache"):
+                    provisioner.provision(manifest, "cpu", NvidiaCapability(False))
+            self.assertEqual(transport.starts, [])
+            with patch("launcher.bootstrap.shutil.disk_usage") as mocked:
+                cache_usage = usage()
+                cache_usage.free = 10**12
+                install_usage = usage()
+                install_usage.free = 1
+                mocked.side_effect = [cache_usage, install_usage]
+                with self.assertRaisesRegex(DownloadError, "installation/staging and rollback"):
+                    provisioner.provision(manifest, "cpu", NvidiaCapability(False))
+            self.assertEqual(transport.starts, [])
 
 
 class UpdateStateTests(unittest.TestCase):
@@ -399,6 +592,9 @@ class UpdateStateTests(unittest.TestCase):
             self.assertEqual(preferences["cache_dir"], str(cache_dir))
             self.assertEqual(runtime_preference(args), "cpu")
             self.assertTrue(_updates_disabled(args))
+            self.assertEqual(args.channel, "beta")
+            self.assertIsNone(args.manifest_url)
+            self.assertIn("/windows-beta/", DEFAULT_BETA_MANIFEST_URL)
 
             explicit = build_launcher_parser().parse_args(
                 ["--install-root", str(install_root), "--runtime", "cuda", "--headless"]
@@ -424,6 +620,163 @@ class UpdateStateTests(unittest.TestCase):
             self.assertFalse(cache.should_check(now=now + timedelta(hours=23, minutes=59)))
             self.assertTrue(cache.should_check(now=now + timedelta(hours=24)))
             self.assertTrue(cache.should_check(now=now, force=True))
+
+    def test_failed_online_check_with_cache_is_throttled_and_downgrades_are_ignored(self) -> None:
+        runtime_zip = make_zip({"python.exe": b"runtime"})
+        app_zip = make_zip({"spimaging/__init__.py": b"app"})
+        runtime = asset_for_bytes(runtime_zip)
+        app = asset_for_bytes(app_zip, asset_id="cached-app", component="app", variant="universal", required_path="spimaging/__init__.py")
+        launch = LaunchSpec("pythonw.exe", "python.exe", "spimaging.desktop", ())
+        current = ReleaseManifest(1, "SPImaging", "0.2.0-beta.2", "beta", "2026-08-24T00:00:00Z", True, (replace(runtime, version="0.2.0-runtime.1"), replace(app, version="0.2.0-beta.2")), launch)
+        older = ReleaseManifest(1, "SPImaging", "0.2.0-beta.1", "beta", "2026-08-23T00:00:00Z", True, (replace(runtime, version="0.2.0-runtime.1"), app), launch)
+        current_raw = json.dumps(manifest_to_dict(current)).encode("utf-8")
+        older_raw = json.dumps(manifest_to_dict(older)).encode("utf-8")
+        url = "https://example.invalid/release-manifest.json"
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = ManifestCache(Path(temporary))
+            cache.store(current_raw, current)
+            resolved, fetched, message = cache.resolve(
+                url,
+                MemoryTransport({url: older_raw}),
+                force_check=True,
+                expected_channel="beta",
+            )
+            self.assertFalse(fetched)
+            self.assertEqual(resolved, current)
+            self.assertIn("downgrade", message)
+            self.assertIsNotNone(cache.last_checked())
+            self.assertFalse(_is_update(ProvisionResult("0.2.0-beta.2", Path(), Path(), "cpu", False, ""), older))
+
+            # A stale candidate cache must not bypass the newer active release
+            # merely because the 24-hour network interval has not elapsed.
+            cache.mark_active(current_raw, current)
+            cache.store(older_raw, older)
+            cache.record_check()
+            offline = MemoryTransport({})
+            with self.assertRaisesRegex(LauncherError, "downgrade"):
+                cache.resolve(url, offline, expected_channel="beta")
+            self.assertEqual(offline.starts, [])
+
+    def test_signed_manifest_is_verified_against_launcher_owned_thumbprint_before_cache(self) -> None:
+        archive = make_zip({"python.exe": b"runtime"})
+        thumbprint = "A" * 40
+        requirement = SignatureRequirement(
+            "cms-detached",
+            True,
+            signer_thumbprint=thumbprint,
+            file_name="asset.zip.p7s",
+            url="https://example.invalid/asset.zip.p7s",
+            size=3,
+            sha256="b" * 64,
+        )
+        runtime = asset_for_bytes(archive, signature=requirement)
+        app = asset_for_bytes(
+            make_zip({"spimaging/__init__.py": b"app"}),
+            asset_id="signed-app",
+            component="app",
+            variant="universal",
+            required_path="spimaging/__init__.py",
+            signature=requirement,
+        )
+        manifest = ReleaseManifest(1, "SPImaging", "0.2.0-beta.1", "beta", "2026-08-23T00:00:00Z", False, (runtime, app), LaunchSpec("pythonw.exe", "python.exe", "spimaging.desktop", ()))
+        raw = json.dumps(manifest_to_dict(manifest)).encode("utf-8")
+        signature = b"trusted manifest signature"
+        url = "https://example.invalid/release-manifest.json"
+        verified: list[tuple[bytes, bytes, str]] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            cache: ManifestCache
+
+            def verify(content: bytes, cms: bytes, expected: str) -> None:
+                if not verified:
+                    self.assertFalse(cache.manifest_path.exists())
+                verified.append((content, cms, expected))
+
+            policy = ManifestTrustPolicy.signed(thumbprint, detached_verifier=verify)
+            cache = ManifestCache(Path(temporary), trust_policy=policy)
+            resolved, fetched, _message = cache.resolve(
+                url,
+                MemoryTransport({url: raw, url + ".p7s": signature}),
+            )
+            self.assertTrue(fetched)
+            self.assertEqual(resolved, manifest)
+            self.assertEqual(verified, [(raw, signature, thumbprint)])
+            self.assertEqual(cache.load(), manifest)
+            self.assertEqual(verified[-1], (raw, signature, thumbprint))
+
+            attacker_requirement = replace(requirement, signer_thumbprint="C" * 40)
+            attacker_manifest = replace(
+                manifest,
+                assets=(replace(runtime, signature=attacker_requirement), app),
+            )
+            attacker_raw = json.dumps(manifest_to_dict(attacker_manifest)).encode("utf-8")
+            verified_before = len(verified)
+            with self.assertRaisesRegex(SignatureError, "not pinned"):
+                policy.verify_manifest(attacker_raw, attacker_manifest, b"attacker cms")
+            self.assertEqual(len(verified), verified_before)
+
+    def test_unsigned_beta_and_formal_signed_trust_modes_are_isolated(self) -> None:
+        # Use a valid unsigned manifest from the provisioning helper rather
+        # than relying on a structurally invalid control document.
+        runtime_zip = make_zip({"python.exe": b"runtime"})
+        app_zip = make_zip({"spimaging/__init__.py": b"app"})
+        runtime = asset_for_bytes(runtime_zip)
+        app = asset_for_bytes(app_zip, asset_id="unsigned-app", component="app", variant="universal", required_path="spimaging/__init__.py")
+        manifest = ReleaseManifest(1, "SPImaging", "0.2.0-beta.1", "beta", "2026-08-23T00:00:00Z", True, (runtime, app), LaunchSpec("pythonw.exe", "python.exe", "spimaging.desktop", ()))
+        raw = json.dumps(manifest_to_dict(manifest)).encode("utf-8")
+        ManifestTrustPolicy.unsigned_beta().verify_manifest(raw, manifest, None)
+        with self.assertRaisesRegex(SignatureError, "signed launcher refuses"):
+            ManifestTrustPolicy.signed("A" * 40, detached_verifier=lambda *_: None).verify_manifest(raw, manifest, b"sig")
+
+    def test_interprocess_lock_fails_clearly_for_second_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "metadata" / "launcher.lock"
+            with InterProcessLock(path, purpose="测试单实例"):
+                with self.assertRaisesRegex(LauncherError, "另一 SPImaging 实例"):
+                    InterProcessLock(path, purpose="测试单实例").acquire()
+
+
+class PrivateRuntimeEnvironmentTests(unittest.TestCase):
+    def test_desktop_command_removes_user_python_and_conda_shadowing(self) -> None:
+        from launcher.bootstrap import build_desktop_command
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            app = root / "app"
+            (runtime / "Scripts").mkdir(parents=True)
+            (runtime / "Library" / "bin").mkdir(parents=True)
+            app.mkdir()
+            (runtime / "python.exe").write_bytes(b"python")
+            manifest = ReleaseManifest(
+                1,
+                "SPImaging",
+                "0.2.0-beta.1",
+                "beta",
+                "2026-08-23T00:00:00Z",
+                True,
+                (),
+                LaunchSpec("pythonw.exe", "python.exe", "spimaging.desktop", ()),
+            )
+            result = ProvisionResult("0.2.0-beta.1", runtime, app, "cpu", False, "")
+            with patch.dict(
+                os.environ,
+                {
+                    "PYTHONHOME": "C:/host-python",
+                    "PYTHONPATH": "C:/untrusted-modules",
+                    "CONDA_PREFIX": "C:/host-conda",
+                    "CONDA_DEFAULT_ENV": "host",
+                    "VIRTUAL_ENV": "C:/venv",
+                },
+                clear=False,
+            ):
+                _command, environment = build_desktop_command(manifest, result)
+            self.assertEqual(environment["PYTHONPATH"], str(app))
+            self.assertEqual(environment["PYTHONNOUSERSITE"], "1")
+            self.assertNotIn("PYTHONHOME", environment)
+            self.assertNotIn("CONDA_PREFIX", environment)
+            self.assertNotIn("CONDA_DEFAULT_ENV", environment)
+            self.assertNotIn("VIRTUAL_ENV", environment)
+            self.assertTrue(environment["PATH"].startswith(str(runtime)))
 
 
 if __name__ == "__main__":

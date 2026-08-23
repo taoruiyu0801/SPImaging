@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import platform
 import re
 import sys
@@ -14,6 +14,7 @@ import zipfile
 
 
 _WINDOWS_USER_PATH = re.compile(r"(?i)\b[A-Z]:\\Users\\[^\\\s\"']+")
+_WINDOWS_ABSOLUTE_TOKEN = re.compile(r"(?i)\b[A-Z]:[\\/][^\s\"']+")
 
 
 def redaction_pairs(extra_paths: Iterable[str | Path] = ()) -> tuple[tuple[str, str], ...]:
@@ -39,7 +40,32 @@ def redact_text(text: str, extra_paths: Iterable[str | Path] = ()) -> str:
     redacted = text
     for raw, token in redaction_pairs(extra_paths):
         redacted = redacted.replace(raw, token)
-    return _WINDOWS_USER_PATH.sub(r"C:\\Users\\<USER>", redacted)
+    redacted = _WINDOWS_USER_PATH.sub(r"C:\\Users\\<USER>", redacted)
+    return _WINDOWS_ABSOLUTE_TOKEN.sub("<ABSOLUTE_PATH>", redacted)
+
+
+def _absolute_paths_in_json(text: str) -> tuple[str, ...]:
+    """Collect configured absolute paths before serialised diagnostics are redacted."""
+
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return ()
+    found: set[str] = set()
+
+    def visit(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for nested in item.values():
+                visit(nested)
+        elif isinstance(item, (list, tuple)):
+            for nested in item:
+                visit(nested)
+        elif isinstance(item, str) and len(item) <= 32_767:
+            if PureWindowsPath(item).is_absolute() or PurePosixPath(item).is_absolute():
+                found.add(item)
+
+    visit(value)
+    return tuple(sorted(found, key=len, reverse=True))
 
 
 def collect_environment() -> dict[str, Any]:
@@ -72,6 +98,7 @@ def export_diagnostic_bundle(
     *,
     run_dir: str | Path | None = None,
     additional_files: Iterable[str | Path] = (),
+    launcher_root: str | Path | None = None,
 ) -> Path:
     """Export logs/config metadata only; sample/checkpoint contents are excluded."""
 
@@ -93,12 +120,39 @@ def export_diagnostic_bundle(
             candidate = root / relative
             if candidate.is_file():
                 file_candidates.append(candidate)
+    if launcher_root is None:
+        local = os.environ.get("LOCALAPPDATA")
+        launcher_root = Path(local) / "SPImaging" if local else Path.home() / ".spimaging"
+    launcher_path = Path(launcher_root).expanduser().resolve()
+    for relative in (
+        "settings.json",
+        "state.json",
+        "metadata/update-check.json",
+        "metadata/release-manifest.json",
+        "metadata/active-release-manifest.json",
+    ):
+        candidate = launcher_path / relative
+        if candidate.is_file():
+            file_candidates.append(candidate)
     file_candidates.extend(Path(value).expanduser().resolve() for value in additional_files)
+
+    # Discover every configured absolute input/output path first. This covers
+    # personal data on drives other than C: and paths containing spaces.
+    unique_candidates = tuple(dict.fromkeys(file_candidates))
+    for candidate in unique_candidates:
+        if not candidate.is_file() or candidate.suffix.lower() not in allowed_suffixes:
+            continue
+        try:
+            candidate_text = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        sensitive_roots.extend(_absolute_paths_in_json(candidate_text))
+    sensitive_roots.append(launcher_path)
 
     with zipfile.ZipFile(destination_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         environment = json.dumps(collect_environment(), ensure_ascii=False, indent=2) + "\n"
         archive.writestr("environment.json", redact_text(environment, sensitive_roots))
-        for index, candidate in enumerate(file_candidates, 1):
+        for index, candidate in enumerate(unique_candidates, 1):
             if not candidate.is_file() or candidate.suffix.lower() not in allowed_suffixes:
                 continue
             try:
@@ -110,4 +164,3 @@ def export_diagnostic_bundle(
                 redact_text(text, sensitive_roots),
             )
     return destination_path
-

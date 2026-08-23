@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import os
 import shutil
 from typing import BinaryIO, Callable, Mapping, Protocol
@@ -40,11 +40,28 @@ class DownloadTransport(Protocol):
     def open(self, url: str, start: int = 0) -> DownloadResponse: ...
 
 
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        file_pointer: BinaryIO,
+        code: int,
+        message: str,
+        headers: Mapping[str, str],
+        new_url: str,
+    ) -> urllib.request.Request | None:
+        parsed = urlparse(new_url)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+            raise urllib.error.URLError("refusing an HTTPS download redirect through an insecure URL")
+        return super().redirect_request(request, file_pointer, code, message, headers, new_url)
+
+
 class UrllibTransport:
     """HTTPS transport using the OS/Python proxy configuration."""
 
     def __init__(self, timeout_seconds: int = 60) -> None:
         self.timeout_seconds = timeout_seconds
+        self._opener = urllib.request.build_opener(_HttpsOnlyRedirectHandler())
 
     def open(self, url: str, start: int = 0) -> DownloadResponse:
         parsed = urlparse(url)
@@ -55,7 +72,11 @@ class UrllibTransport:
             headers["Range"] = f"bytes={start}-"
         request = urllib.request.Request(url, headers=headers)
         try:
-            response = urllib.request.urlopen(request, timeout=self.timeout_seconds)
+            response = self._opener.open(request, timeout=self.timeout_seconds)
+        except urllib.error.HTTPError as error:
+            # Preserve the status so resume logic can recover from a stale
+            # Range request (notably HTTP 416) without an infinite retry loop.
+            return DownloadResponse(error, error.code, error.headers)
         except (urllib.error.URLError, OSError) as error:
             raise DownloadError(f"download request failed for {url}: {error}") from error
         final_url = response.geturl()
@@ -63,6 +84,36 @@ class UrllibTransport:
             response.close()
             raise DownloadError("refusing a download redirected away from HTTPS")
         return DownloadResponse(response, getattr(response, "status", response.getcode()), response.headers)
+
+
+class LocalDirectoryTransport:
+    """Read manifest-declared asset basenames from an explicit offline bundle."""
+
+    def __init__(self, asset_directory: Path) -> None:
+        self.asset_directory = asset_directory.expanduser().resolve(strict=True)
+        if not self.asset_directory.is_dir():
+            raise DownloadError(f"offline asset directory is not a directory: {self.asset_directory}")
+
+    def open(self, url: str, start: int = 0) -> DownloadResponse:
+        parsed = urlparse(url)
+        name = PurePosixPath(parsed.path).name
+        if parsed.scheme != "https" or not name or name in {".", ".."}:
+            raise DownloadError("offline assets still require a valid HTTPS manifest URL and filename")
+        candidate = (self.asset_directory / name).resolve(strict=False)
+        try:
+            candidate.relative_to(self.asset_directory)
+        except ValueError as error:
+            raise DownloadError(f"offline asset path escapes the bundle: {name}") from error
+        if candidate.is_symlink() or not candidate.is_file():
+            raise DownloadError(f"offline bundle is missing asset: {name}")
+        size = candidate.stat().st_size
+        if start < 0 or start > size:
+            return DownloadResponse(candidate.open("rb"), 416, {})
+        stream = candidate.open("rb")
+        if start:
+            stream.seek(start)
+            return DownloadResponse(stream, 206, {"Content-Range": f"bytes {start}-{size - 1}/{size}"})
+        return DownloadResponse(stream, 200, {"Content-Length": str(size)})
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -91,6 +142,7 @@ def download_part(
     transport: DownloadTransport,
     progress: ProgressCallback | None = None,
     chunk_size: int = 1024 * 1024,
+    _allow_range_restart: bool = True,
 ) -> Path:
     """Download one part, preserving a trustworthy partial file for resume."""
 
@@ -108,6 +160,16 @@ def download_part(
     if start > part.size:
         partial.unlink()
         start = 0
+    elif start == part.size:
+        if validate_file(partial, part.size, part.sha256):
+            os.replace(partial, destination)
+            if progress:
+                progress(part.name, part.size, part.size)
+            return destination
+        # A complete-length but invalid partial must restart at byte zero;
+        # requesting bytes=<size>- commonly yields HTTP 416 forever.
+        partial.unlink()
+        start = 0
     try:
         response = transport.open(part.url, start)
     except DownloadError:
@@ -115,6 +177,16 @@ def download_part(
     except Exception as error:
         raise DownloadError(f"download request failed for {part.name}: {error}") from error
     with response:
+        if response.status == 416 and start > 0 and _allow_range_restart:
+            partial.unlink(missing_ok=True)
+            return download_part(
+                part,
+                destination,
+                transport,
+                progress,
+                chunk_size,
+                _allow_range_restart=False,
+            )
         if response.status not in {200, 206}:
             raise DownloadError(f"server returned HTTP {response.status} for {part.name}")
         append = start > 0 and response.status == 206

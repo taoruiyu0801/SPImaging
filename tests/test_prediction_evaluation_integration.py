@@ -102,10 +102,15 @@ def test_correct_checkpoint_batch_evaluation(tmp_path: Path) -> None:
     with (output_dir / "metrics_per_sample.csv").open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
     summary = json.loads((output_dir / "metrics_summary.json").read_text(encoding="utf-8"))
+    progress = json.loads((output_dir / "evaluation_progress.json").read_text(encoding="utf-8"))
 
     assert len(rows) == 4
     assert {row["sample"] for row in rows} == {f"sample_{index:05d}.npz" for index in range(4)}
     assert summary["day25-simple3d"]["n_samples"] == 4
+    assert summary["day25-simple3d"]["complete"] is True
+    assert progress["status"] == "complete"
+    assert progress["completed_rows"] == 4
+    assert progress["completed_models"] == 1
     assert (output_dir / "comparison.png").is_file()
 
 

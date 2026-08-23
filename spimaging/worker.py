@@ -30,6 +30,7 @@ from spimaging.generation.recovery import partial_directory_for
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CHILD_EVENT_PREFIX = "SPIMAGING_EVENT "
 TERMINATION_GRACE_SECONDS = 10.0
+TERMINAL_RESERVE_BYTES = 64 * 1024
 
 
 class WorkerError(RuntimeError):
@@ -63,7 +64,8 @@ def _effective_values(values: Mapping[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in values.items()
-        if not (key in {"max_samples", "early_stopping_patience"} and value == 0)
+        if value is not None
+        and not (key in {"max_samples", "early_stopping_patience"} and value == 0)
     }
 
 
@@ -76,6 +78,8 @@ def _append_parameter_arguments(
     for name, value in _effective_values(values).items():
         parameter = known.get(name)
         if parameter is None:
+            continue
+        if not parameter.is_visible(values):
             continue
         _flag_value(arguments, parameter.cli_flag or f"--{name}", value)
 
@@ -163,6 +167,8 @@ class WorkerRuntime:
         self.manifest: ResultManifest | None = None
         self.history = HistoryStore(_history_path(config))
         self._control_thread: threading.Thread | None = None
+        self._terminal_reserve = self.layout.root / ".terminal-reserve"
+        self._storage_prepared = False
 
     def start_control_reader(self, stream: TextIO | None = None) -> None:
         source = stream if stream is not None else sys.stdin
@@ -193,6 +199,263 @@ class WorkerRuntime:
         self.storage.write_result(self.manifest)
         self.history.upsert(self.config, status, self.manifest.metrics)
         self.events.emit(EventType.STATE, {"status": status, **payload})
+
+    def _create_terminal_reserve(self) -> None:
+        """Reserve enough allocated bytes for a compact terminal record."""
+
+        reserve = self._terminal_reserve
+        try:
+            if reserve.is_symlink():
+                raise OSError("terminal reserve cannot be a symbolic link")
+            if reserve.exists():
+                if not reserve.is_file():
+                    raise OSError("terminal reserve path is not a file")
+                reserve.unlink()
+            with reserve.open("xb") as handle:
+                handle.write(b"\0" * TERMINAL_RESERVE_BYTES)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            # Reserving space is an optimization. Failure here must not stop a
+            # run that can otherwise proceed, and terminalization still tries
+            # every normal and compact persistence path.
+            try:
+                if reserve.is_file() and not reserve.is_symlink():
+                    reserve.unlink()
+            except OSError:
+                pass
+
+    def _release_terminal_reserve(self) -> None:
+        try:
+            if self._terminal_reserve.is_file() and not self._terminal_reserve.is_symlink():
+                self._terminal_reserve.unlink()
+        except OSError:
+            pass
+
+    def _confined_terminal_path(self, path: Path) -> Path:
+        """Accept only fixed direct children of this run directory."""
+
+        root = self.layout.root.resolve()
+        candidate = path.absolute()
+        if candidate.parent.resolve() != root:
+            raise ValueError("terminal fallback path escaped the run directory")
+        if candidate.name not in {"result_manifest.json", "events.jsonl"}:
+            raise ValueError("terminal fallback path is not an authoritative run file")
+        if candidate.is_symlink():
+            raise ValueError("terminal fallback refuses symbolic-link targets")
+        self._assert_run_directory_ownership()
+        return candidate
+
+    def _assert_run_directory_ownership(self) -> None:
+        if self._storage_prepared:
+            return
+        try:
+            existing = RunConfig.load(self.layout.config)
+        except ValueError as exc:
+            raise ValueError(
+                "terminal fallback cannot verify ownership of the run directory"
+            ) from exc
+        configured_root = Path(existing.output.run_dir).expanduser().resolve()
+        if existing.run_id != self.config.run_id or configured_root != self.layout.root.resolve():
+            raise ValueError("terminal fallback run directory belongs to another task")
+
+    def _write_compact_terminal_manifest(
+        self,
+        status: str,
+        error: Mapping[str, Any] | None,
+        secondary_errors: list[str],
+    ) -> None:
+        """Write an authoritative manifest, compacting only when space requires it."""
+
+        path = self._confined_terminal_path(self.layout.result)
+        emergency_warnings = [
+            "终态使用紧急精简清单写入。",
+            *(message[:1000] for message in secondary_errors[-4:]),
+        ]
+        fallback = self.manifest
+        encoded: str | None = None
+        if fallback is not None:
+            for warning in emergency_warnings:
+                if warning not in fallback.warnings:
+                    fallback.warnings.append(warning)
+            try:
+                candidate = json.dumps(
+                    fallback.to_dict(),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ) + "\n"
+                if len(candidate.encode("utf-8")) <= TERMINAL_RESERVE_BYTES * 3 // 4:
+                    encoded = candidate
+            except (TypeError, ValueError):
+                encoded = None
+        if encoded is None:
+            compact_error = None
+            if error is not None:
+                compact_error = {
+                    "category": str(error.get("category", "WorkerError"))[:200],
+                    "message": str(error.get("message", ""))[:4000],
+                }
+                secondary = error.get("secondary_errors")
+                if isinstance(secondary, list):
+                    compact_error["secondary_errors"] = [
+                        str(item)[:1000] for item in secondary[-4:]
+                    ]
+            fallback = ResultManifest.new(self.config)
+            if self.manifest is not None:
+                fallback.started_at = self.manifest.started_at
+            fallback.warnings = emergency_warnings
+            fallback.set_status(status, error=compact_error)
+            encoded = json.dumps(
+                fallback.to_dict(),
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ) + "\n"
+        temporary = path.with_name(
+            f".{path.name}.terminal-{os.getpid()}-{time.time_ns()}.tmp"
+        )
+        if temporary.parent != path.parent:
+            raise ValueError("terminal fallback temporary path escaped the run directory")
+        try:
+            try:
+                with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, path)
+            except Exception as atomic_exc:
+                # Last resort for a full filesystem: truncating the already
+                # allocated authoritative file can succeed when creating or
+                # renaming another directory entry cannot. This path is used
+                # only after the atomic attempt failed.
+                try:
+                    with path.open("w", encoding="utf-8", newline="\n") as handle:
+                        handle.write(encoded)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                except Exception as direct_exc:
+                    raise OSError(
+                        "atomic and in-place terminal manifest writes both failed: "
+                        f"{atomic_exc}; {direct_exc}"
+                    ) from direct_exc
+        finally:
+            try:
+                if temporary.exists() and not temporary.is_symlink():
+                    temporary.unlink()
+            except OSError:
+                pass
+        self.manifest = fallback
+
+    @staticmethod
+    def _secondary_error(stage: str, exc: Exception) -> str:
+        return f"{stage}: {type(exc).__name__}: {exc}"
+
+    def _emit_terminal_event_best_effort(
+        self,
+        event_type: EventType,
+        payload: Mapping[str, Any],
+        secondary_errors: list[str],
+    ) -> None:
+        try:
+            self.events.emit(event_type, payload)
+            return
+        except Exception as exc:
+            secondary_errors.append(self._secondary_error(f"emit {event_type.value}", exc))
+        try:
+            event_path = self._confined_terminal_path(self.layout.events)
+            EventWriter(self.config.run_id, event_path=event_path).emit(event_type, payload)
+        except Exception as exc:
+            secondary_errors.append(
+                self._secondary_error(f"fallback emit {event_type.value}", exc)
+            )
+
+    def _finalize_terminal(
+        self,
+        status: str,
+        *,
+        error: Mapping[str, Any] | None = None,
+        message: str | None = None,
+        collect_results: bool = True,
+    ) -> None:
+        """Persist terminal state without allowing cleanup failures to mask cause."""
+
+        self._release_terminal_reserve()
+        secondary_errors: list[str] = []
+        if self.manifest is None:
+            self.manifest = ResultManifest.new(self.config)
+
+        try:
+            self._assert_run_directory_ownership()
+            owns_run_directory = True
+        except Exception as exc:
+            owns_run_directory = False
+            secondary_errors.append(self._secondary_error("verify run ownership", exc))
+
+        if collect_results and owns_run_directory:
+            try:
+                self._collect_results()
+            except Exception as exc:
+                secondary_errors.append(self._secondary_error("collect_results", exc))
+
+        terminal_error = None if error is None else dict(error)
+        if terminal_error is not None and secondary_errors:
+            terminal_error["secondary_errors"] = list(secondary_errors)
+        self.manifest.warnings.extend(
+            f"终态清理警告：{item}" for item in secondary_errors
+        )
+        try:
+            self.manifest.set_status(status, error=terminal_error)
+        except Exception as exc:
+            secondary_errors.append(self._secondary_error("set terminal status", exc))
+            self.manifest = ResultManifest.new(self.config)
+            self.manifest.set_status(status, error=terminal_error)
+
+        if not owns_run_directory:
+            return
+
+        try:
+            self.storage.write_result(self.manifest)
+        except Exception as exc:
+            secondary_errors.append(self._secondary_error("write terminal manifest", exc))
+            try:
+                self._write_compact_terminal_manifest(status, terminal_error, secondary_errors)
+            except Exception as fallback_exc:
+                secondary_errors.append(
+                    self._secondary_error("fallback terminal manifest", fallback_exc)
+                )
+
+        try:
+            self.history.upsert(self.config, status, self.manifest.metrics)
+        except Exception as exc:
+            secondary_errors.append(self._secondary_error("write terminal history", exc))
+
+        state_payload: dict[str, Any] = {"status": status}
+        if terminal_error is not None:
+            state_payload["error"] = terminal_error
+        if message:
+            state_payload["message"] = message
+        self._emit_terminal_event_best_effort(
+            EventType.STATE,
+            state_payload,
+            secondary_errors,
+        )
+        if status == "failed" and terminal_error is not None:
+            self._emit_terminal_event_best_effort(
+                EventType.ERROR,
+                terminal_error,
+                secondary_errors,
+            )
+        completed_payload: dict[str, Any] = {"status": status}
+        if status == "succeeded":
+            completed_payload["result_manifest"] = str(self.layout.result)
+        if message:
+            completed_payload["message"] = message
+        self._emit_terminal_event_best_effort(
+            EventType.COMPLETED,
+            completed_payload,
+            secondary_errors,
+        )
 
     def _child_environment(self) -> dict[str, str]:
         environment = os.environ.copy()
@@ -371,6 +634,44 @@ class WorkerRuntime:
             arguments.extend(("--resume_checkpoint", training.resume_checkpoint))
         return _module_command(module, arguments)
 
+    def _training_resume_dataset(self) -> Path | None:
+        """Resolve the exact dataset used by a resumable training checkpoint.
+
+        A cloned full-pipeline run must not regenerate source data: doing so can
+        change bytes and therefore invalidate the checkpoint's dataset
+        fingerprint. External datasets remain explicitly configured, while a
+        generated dataset is recovered from the checkpoint's owning run.
+        """
+
+        training_requested = self.config.workflow == "train" or self.config.training.enabled
+        checkpoint_value = self.config.training.resume_checkpoint
+        if not training_requested or not checkpoint_value:
+            return None
+
+        if self.config.input.dataset_paths:
+            candidate = Path(self.config.input.dataset_paths[0]).expanduser().resolve()
+            return candidate.parent if candidate.is_file() else candidate
+
+        checkpoint = Path(checkpoint_value).expanduser().resolve()
+        if not checkpoint.is_file():
+            raise WorkerError(f"恢复 checkpoint 不存在：{checkpoint}")
+        if checkpoint.parent.name != "checkpoints":
+            raise WorkerError("恢复生成数据时 checkpoint 必须来自原运行目录的 checkpoints 文件夹")
+
+        original_run = checkpoint.parent.parent.resolve()
+        original_config_path = original_run / "run.json"
+        try:
+            original_config = RunConfig.load(original_config_path)
+        except ValueError as exc:
+            raise WorkerError(f"无法验证 checkpoint 所属的原运行目录：{exc}") from exc
+        if Path(original_config.output.run_dir).expanduser().resolve() != original_run:
+            raise WorkerError("checkpoint 所属运行配置指向了另一个目录")
+
+        generated_dataset = original_run / "artifacts" / "dataset"
+        if not _completed_generation_is_valid(generated_dataset):
+            raise WorkerError("原运行的生成数据不完整或校验失败，不能安全恢复训练")
+        return generated_dataset.resolve()
+
     def _prediction_command(self, checkpoint: Path, sample: Path, index: int) -> list[str]:
         return _module_command(
             "spimaging.testing.predict",
@@ -399,11 +700,16 @@ class WorkerRuntime:
         return _module_command("spimaging.testing.evaluate", arguments)
 
     def _resolve_dataset(self) -> Path:
+        if self.config.workflow == "evaluate" and self.config.evaluation.dataset_dir:
+            return Path(self.config.evaluation.dataset_dir).expanduser().resolve()
         if self.config.input.dataset_paths:
             candidate = Path(self.config.input.dataset_paths[0]).expanduser().resolve()
             if candidate.is_file():
                 return candidate.parent
             return candidate
+        explicit_sample = self.config.prediction.sample_file or self.config.input.sample_file
+        if explicit_sample:
+            return Path(explicit_sample).expanduser().resolve().parent
         return _public_demo_dataset()
 
     def _resolve_checkpoint(self) -> Path:
@@ -446,10 +752,17 @@ class WorkerRuntime:
             self.layout.result.resolve(),
             self.layout.log.resolve(),
             self.layout.cancel_request.resolve(),
+            self._terminal_reserve.resolve(),
         }
         self.manifest.artifacts.clear()
         for path in sorted(self.layout.root.rglob("*")):
             if not path.is_file() or path.resolve() in excluded:
+                continue
+            # Matplotlib creates implementation-detail caches next to figures
+            # when a CLI is run in an isolated environment.  They are neither
+            # experiment results nor portable metadata and must not leak into
+            # the result manifest or user exports.
+            if ".matplotlib-cache" in path.parts:
                 continue
             relative = self.storage.relative_to_root(path)
             suffix = path.suffix.lower()
@@ -488,11 +801,13 @@ class WorkerRuntime:
             time.sleep(0.02)
 
     def execute(self) -> int:
-        self.cancel.clear_file()
-        self.manifest = self.storage.prepare()
-        self.history.upsert(self.config, "preparing")
-        self.start_control_reader()
         try:
+            self.cancel.clear_file()
+            self.manifest = self.storage.prepare()
+            self._storage_prepared = True
+            self._create_terminal_reserve()
+            self.history.upsert(self.config, "preparing")
+            self.start_control_reader()
             self._set_status("running")
             if self.config.workflow == "noop":
                 self._run_noop()
@@ -510,8 +825,19 @@ class WorkerRuntime:
                     ),
                 )
             else:
-                dataset: Path | None = None
-                if self.config.workflow == "generate" or self.config.generation.enabled:
+                dataset = self._training_resume_dataset()
+                generation_requested = (
+                    self.config.workflow == "generate" or self.config.generation.enabled
+                )
+                if dataset is not None and generation_requested:
+                    self.events.emit(
+                        EventType.WARNING,
+                        {
+                            "stage": "generate",
+                            "message": "恢复训练将复用原运行数据集，已跳过重新生成。",
+                        },
+                    )
+                elif generation_requested:
                     dataset = self.layout.artifacts / "dataset"
                     partial_exists = partial_directory_for(dataset).is_dir()
                     if (
@@ -537,9 +863,6 @@ class WorkerRuntime:
 
                 prediction_requested = self.config.workflow == "predict" or self.config.prediction.enabled
                 evaluation_requested = self.config.workflow == "evaluate" or self.config.evaluation.enabled
-                if self.config.workflow == "full_pipeline":
-                    prediction_requested = True
-                    evaluation_requested = True
 
                 checkpoint: Path | None = None
                 if prediction_requested or evaluation_requested:
@@ -566,26 +889,34 @@ class WorkerRuntime:
                     checkpoints = tuple(Path(value).expanduser().resolve() for value in configured)
                     if not checkpoints and checkpoint is not None:
                         checkpoints = (checkpoint,)
-                    self.run_command("evaluate", self._evaluation_command(checkpoints, dataset))
+                    evaluation_dataset = dataset
+                    if self.config.evaluation.dataset_dir:
+                        evaluation_dataset = Path(
+                            self.config.evaluation.dataset_dir
+                        ).expanduser().resolve()
+                    self.run_command(
+                        "evaluate",
+                        self._evaluation_command(checkpoints, evaluation_dataset),
+                    )
 
-            self._collect_results()
-            self._set_status("succeeded")
-            self.events.emit(
-                EventType.COMPLETED,
-                {"status": "succeeded", "result_manifest": str(self.layout.result)},
-            )
+            try:
+                self._collect_results()
+            except Exception as exc:
+                error = {"category": type(exc).__name__, "message": str(exc)}
+                self._finalize_terminal(
+                    "failed",
+                    error=error,
+                    collect_results=False,
+                )
+                return 1
+            self._finalize_terminal("succeeded", collect_results=False)
             return 0
         except WorkerCancelled as exc:
-            self._collect_results()
-            self._set_status("cancelled", message=str(exc))
-            self.events.emit(EventType.COMPLETED, {"status": "cancelled"})
+            self._finalize_terminal("cancelled", message=str(exc))
             return 130
         except Exception as exc:
             error = {"category": type(exc).__name__, "message": str(exc)}
-            self._collect_results()
-            self._set_status("failed", error=error)
-            self.events.emit(EventType.ERROR, error)
-            self.events.emit(EventType.COMPLETED, {"status": "failed"})
+            self._finalize_terminal("failed", error=error)
             return 1
 
 

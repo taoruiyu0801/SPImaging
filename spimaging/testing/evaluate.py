@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import zipfile
 
 import numpy as np
 
+from spimaging.appcore.storage import atomic_write_text
 from spimaging.cli import (
     ArgumentParser,
     HelpFormatter,
@@ -23,6 +25,52 @@ from spimaging.cli import (
     validate_npz_archive,
     validate_output_directory,
 )
+
+
+_METRIC_FIELDS = ["model", "sample", "mae_m", "rmse_m", "abs_rel"]
+
+
+def _model_summary(metrics):
+    return {
+        "n_samples": len(metrics),
+        "mae_m": float(np.mean([item["mae_m"] for item in metrics])),
+        "rmse_m": float(np.mean([item["rmse_m"] for item in metrics])),
+        "abs_rel": float(np.mean([item["abs_rel"] for item in metrics])),
+    }
+
+
+def _persist_progress(output_dir, rows, summary, *, status, error=None):
+    """Atomically retain every completed evaluation result.
+
+    The regular CSV/summary paths always contain only fully computed rows.  A
+    separate progress record distinguishes partial/failed output from a
+    successful comparison so callers never need to infer completion from file
+    presence alone.
+    """
+
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=_METRIC_FIELDS, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    atomic_write_text(output_dir / "metrics_per_sample.csv", buffer.getvalue())
+    atomic_write_text(
+        output_dir / "metrics_summary.json",
+        json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+    )
+    progress = {
+        "schema_version": 1,
+        "status": status,
+        "completed_rows": len(rows),
+        "completed_models": sum(
+            1 for item in summary.values() if item.get("complete", False)
+        ),
+    }
+    if error:
+        progress["error"] = str(error)
+    atomic_write_text(
+        output_dir / "evaluation_progress.json",
+        json.dumps(progress, indent=2, ensure_ascii=False) + "\n",
+    )
 
 
 def build_parser():
@@ -176,8 +224,15 @@ def save_comparison_figure(output_path, sample_path, target, predictions):
 
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
+    temporary = output_path.with_name(
+        f".{output_path.stem}.{os.getpid()}.tmp{output_path.suffix}"
+    )
+    try:
+        plt.savefig(temporary, dpi=200, bbox_inches="tight")
+        os.replace(temporary, output_path)
+    finally:
+        plt.close(fig)
+        temporary.unlink(missing_ok=True)
 
 
 def main():
@@ -230,29 +285,32 @@ def main():
         return_selection=True,
     )
     device = selection.device
-    for checkpoint in checkpoints:
-        try:
-            model, _, _ = load_model(checkpoint, device)
-        except (
-            EOFError,
-            IndexError,
-            KeyError,
-            OSError,
-            RuntimeError,
-            ValueError,
-            pickle.UnpicklingError,
-        ) as exc:
-            parser.error(f"cannot load --checkpoint {checkpoint}: {exc}")
-        del model
-
     rows = []
     summary = {}
     figure_predictions = []
     figure_target = None
     figure_sample = samples[args.figure_index]
+    output_prepared = False
 
     try:
         for label, checkpoint in zip(labels, checkpoints):
+            try:
+                model, _, _ = load_model(checkpoint, device)
+            except (
+                EOFError,
+                IndexError,
+                KeyError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                pickle.UnpicklingError,
+            ) as exc:
+                raise ValueError(f"cannot load --checkpoint {checkpoint}: {exc}") from exc
+            del model
+            if not output_prepared:
+                create_output_directory(parser, output_dir, option="--output_dir")
+                _persist_progress(output_dir, rows, summary, status="running")
+                output_prepared = True
             per_model = []
             for sample in samples:
                 pred, target = predict_one(checkpoint, sample, device)
@@ -260,38 +318,41 @@ def main():
                 row = {"model": label, "sample": sample.name, **metrics}
                 rows.append(row)
                 per_model.append(metrics)
+                summary[label] = {**_model_summary(per_model), "complete": False}
+                _persist_progress(output_dir, rows, summary, status="running")
                 if sample == figure_sample:
                     figure_predictions.append((label, pred))
                     figure_target = target
 
-            summary[label] = {
-                "n_samples": len(per_model),
-                "mae_m": float(np.mean([m["mae_m"] for m in per_model])),
-                "rmse_m": float(np.mean([m["rmse_m"] for m in per_model])),
-                "abs_rel": float(np.mean([m["abs_rel"] for m in per_model])),
-            }
+            summary[label] = {**_model_summary(per_model), "complete": True}
+            _persist_progress(output_dir, rows, summary, status="running")
     except (
         EOFError,
         IndexError,
         KeyError,
+        MemoryError,
         OSError,
+        RuntimeError,
         ValueError,
+        pickle.UnpicklingError,
         zipfile.BadZipFile,
     ) as exc:
+        if output_prepared:
+            _persist_progress(output_dir, rows, summary, status="failed", error=exc)
         parser.error(f"cannot evaluate the supplied checkpoint or dataset: {exc}")
 
-    create_output_directory(parser, output_dir, option="--output_dir")
-
-    with open(output_dir / "metrics_per_sample.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["model", "sample", "mae_m", "rmse_m", "abs_rel"])
-        writer.writeheader()
-        writer.writerows(rows)
-
-    with open(output_dir / "metrics_summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-
     if figure_target is not None:
-        save_comparison_figure(output_dir / "comparison.png", figure_sample, figure_target, figure_predictions)
+        try:
+            save_comparison_figure(
+                output_dir / "comparison.png",
+                figure_sample,
+                figure_target,
+                figure_predictions,
+            )
+        except (MemoryError, OSError, RuntimeError, ValueError) as exc:
+            _persist_progress(output_dir, rows, summary, status="failed", error=exc)
+            parser.error(f"cannot save evaluation comparison: {exc}")
+    _persist_progress(output_dir, rows, summary, status="complete")
 
     print(f"Device: {device}")
     if selection.fallback:

@@ -29,9 +29,11 @@ from spimaging.appcore.specs import (
     AlgorithmSpec,
     ParameterSpec,
     get_algorithm,
+    training_preset_values,
     validate_training_parameters,
 )
 from spimaging.appcore.storage import ArtifactRecord, ResultManifest, safe_relative_path
+from spimaging.generation.recovery import partial_directory_for
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -194,14 +196,14 @@ class ParameterFormState:
 
     def reset(self) -> None:
         if self.category == "reconstruction":
-            if self.preset not in TRAINING_PRESETS:
-                raise ValueError(f"未知训练预设：{self.preset}")
-            self.values = dict(TRAINING_PRESETS[self.preset])
+            self.values = self.algorithm_spec.parameter_defaults()
+            self.values.update(training_preset_values(self.algorithm, self.preset))
         else:
             self.values = {item.name: item.default for item in self.common_specs}
-        self.values.update(self.algorithm_spec.parameter_defaults())
+            self.values.update(self.algorithm_spec.parameter_defaults())
 
     def set_algorithm(self, algorithm: str) -> None:
+        previous_algorithm = self.algorithm
         previous_common = {
             item.name: self.values[item.name]
             for item in self.common_specs
@@ -210,20 +212,29 @@ class ParameterFormState:
         get_algorithm(self.category, algorithm)
         self.algorithm = algorithm
         self.reset()
-        self.values.update(previous_common)
+        if self.category == "reconstruction":
+            old_defaults = training_preset_values(previous_algorithm, self.preset)
+            new_defaults = training_preset_values(algorithm, self.preset)
+            self.values.update(
+                {
+                    name: value
+                    for name, value in previous_common.items()
+                    if value != old_defaults.get(name) or old_defaults.get(name) == new_defaults.get(name)
+                }
+            )
+        else:
+            self.values.update(previous_common)
 
     def apply_preset(self, preset: str) -> None:
         if self.category != "reconstruction":
             raise ValueError("仿真参数不支持训练预设")
         if preset not in TRAINING_PRESETS:
             raise ValueError(f"未知训练预设：{preset}")
-        algorithm_values = {
-            item.name: self.values.get(item.name, item.default)
-            for item in self.algorithm_spec.parameters
-        }
+        if preset == "custom":
+            self.preset = preset
+            return
         self.preset = preset
-        self.values = dict(TRAINING_PRESETS[preset])
-        self.values.update(algorithm_values)
+        self.reset()
 
     def set_value(self, name: str, value: Any) -> None:
         known = {item.name: item for item in self.specs}
@@ -398,6 +409,20 @@ def clone_run_config(
             raise ValueError(f"恢复训练的目标轮数必须大于原目标 {original_epochs}")
         data["training"]["parameters"]["epochs"] = new_epochs
         data["training"]["resume_checkpoint"] = str(Path(resume_checkpoint).expanduser().resolve())
+        if config.generation.enabled:
+            generated_dataset = (
+                Path(config.output.run_dir).expanduser().resolve() / "artifacts" / "dataset"
+            )
+            if not generated_dataset.is_dir() or not any(generated_dataset.glob("*.npz")):
+                raise ValueError("原任务没有可复用的完整生成数据，不能安全恢复训练")
+            # A resumed checkpoint is fingerprinted against the original
+            # generated samples.  Re-generating into the new run would make
+            # recovery dependent on simulator/runtime details and may fail the
+            # content fingerprint check.
+            data["generation"]["enabled"] = False
+            data["generation"]["resume"] = False
+            data["input"]["dataset_paths"] = [str(generated_dataset)]
+            data["evaluation"]["dataset_dir"] = str(generated_dataset)
     return RunConfig.from_dict(data)
 
 
@@ -719,6 +744,23 @@ class ResultGalleryModel:
             if artifact.kind == "checkpoint" and path.is_file():
                 return path
         return None
+
+    def generation_resume_directory(self) -> Path | None:
+        """Return the owned partial generation directory for same-run resume."""
+
+        if self.manifest.status not in RESUMABLE_STATUSES:
+            return None
+        if self.config.workflow != "generate" and not self.config.generation.enabled:
+            return None
+        dataset = self.run_dir / "artifacts" / "dataset"
+        partial = partial_directory_for(dataset)
+        return partial if partial.is_dir() else None
+
+    def resume_available(self) -> bool:
+        return (
+            self.generation_resume_directory() is not None
+            or self.compatible_resume_checkpoint() is not None
+        )
 
 
 def _load_source_visuals(path: Path) -> tuple[Any | None, Any | None, Any | None, dict[str, Any]]:

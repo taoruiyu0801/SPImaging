@@ -264,6 +264,15 @@ class MainWindow(QMainWindow):
     def prepare_resume(self, run_dir: str) -> None:
         try:
             model = ResultGalleryModel.load(run_dir)
+            if model.generation_resume_directory() is not None:
+                # Generation recovery owns a sibling partial directory and must
+                # keep the original run ID/output path.  Its manifest validates
+                # the generation config and resumes only unfinished samples.
+                self.start_config(model.config)
+                self.statusBar().showMessage(
+                    tr("MainWindow", "正在原任务目录继续未完成的数据生成。"), 7000
+                )
+                return
             checkpoint = model.compatible_resume_checkpoint()
             if checkpoint is None:
                 raise ValueError("该任务没有兼容的恢复 checkpoint")

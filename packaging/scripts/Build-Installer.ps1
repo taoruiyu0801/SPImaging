@@ -19,12 +19,29 @@ if (-not $IsccPath) {
     $common = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
     if (Test-Path -LiteralPath $common) { $IsccPath = $common }
 }
+if (-not $IsccPath -and $env:LOCALAPPDATA) {
+    $perUser = Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"
+    if (Test-Path -LiteralPath $perUser) { $IsccPath = $perUser }
+}
 if (-not $IsccPath -or -not (Test-Path -LiteralPath $IsccPath -PathType Leaf)) {
     throw "Missing external prerequisite: Inno Setup 6 ISCC.exe. Launcher and release assets remain usable."
 }
 $launcher = Join-Path $outputRoot "launcher\SPImaging.exe"
 if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
     throw "Missing launcher artifact: $launcher. Run Build-Launcher.ps1 first."
+}
+$legalInputs = @(
+    (Join-Path $repoRoot "LICENSE"),
+    (Join-Path $repoRoot "NOTICE"),
+    (Join-Path $repoRoot "THIRD_PARTY_LICENSES.md"),
+    (Join-Path $repoRoot "SBOM.md"),
+    (Join-Path $repoRoot "public_demo\CC0_NOTICE.md"),
+    (Join-Path $repoRoot "public_demo\CC0-1.0.txt")
+)
+foreach ($legalInput in $legalInputs) {
+    if (-not (Test-Path -LiteralPath $legalInput -PathType Leaf)) {
+        throw "Missing installer legal/compliance input: $legalInput"
+    }
 }
 if ($InnoSignToolCommand -and $SigningPfxPath) {
     throw "Choose either -InnoSignToolCommand or -SigningPfxPath, not both."

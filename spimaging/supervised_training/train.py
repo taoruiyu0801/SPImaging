@@ -11,6 +11,8 @@ from spimaging.cli import (
     add_device_arguments,
     create_output_directory,
     fraction,
+    model_base_channels,
+    model_num_blocks,
     nonnegative_float,
     nonnegative_int,
     positive_float,
@@ -23,6 +25,23 @@ from spimaging.cli import (
 )
 
 MODEL_CHOICES = ("simple3d", "prsnet", "penonlocal", "stin")
+SUPERVISED_RESUME_SIGNATURE_FIELDS = (
+    "model",
+    "base_channels",
+    "num_blocks",
+    "batch_size",
+    "lr",
+    "weight_decay",
+    "val_fraction",
+    "seed",
+    "temporal_downsample",
+    "target_sigma_bins",
+    "target_source",
+    "no_log_counts",
+    "tv_weight",
+    "early_stopping_patience",
+    "early_stopping_min_delta",
+)
 
 
 def apply_kaiming_initialization(model):
@@ -122,13 +141,13 @@ def build_parser():
     )
     parser.add_argument(
         "--base_channels",
-        type=positive_int,
+        type=model_base_channels,
         default=8,
         help="Number of base feature channels in the network (>= 1).",
     )
     parser.add_argument(
         "--num_blocks",
-        type=positive_int,
+        type=model_num_blocks,
         default=10,
         help="Number of residual/non-local blocks for larger models (>= 1).",
     )
@@ -230,7 +249,11 @@ def run_epoch(
     from tqdm import tqdm
 
     from spimaging.training_common.losses import depth_tv_loss, temporal_kl_loss
-    from spimaging.training_common.events import emit_event, raise_if_cancelled
+    from spimaging.training_common.events import (
+        emit_event,
+        raise_if_cancelled,
+        structured_events_enabled,
+    )
     from spimaging.training_common.utils import match_distribution_shape
 
     model.train(train)
@@ -240,7 +263,15 @@ def run_epoch(
     total_mae_m = 0.0
     n_items = 0
 
-    for batch_idx, batch in enumerate(tqdm(loader, desc="train" if train else "val", leave=False), start=1):
+    for batch_idx, batch in enumerate(
+        tqdm(
+            loader,
+            desc="train" if train else "val",
+            leave=False,
+            disable=structured_events_enabled(),
+        ),
+        start=1,
+    ):
         if batch_idx <= int(start_batch):
             continue
         if train:
@@ -421,28 +452,16 @@ def main(argv=None, *, event_callback=None, cancel_check=None):
     dataset_hash = dataset_fingerprint(files)
     signature = build_resume_signature(
         args,
-        (
-            "model",
-            "base_channels",
-            "num_blocks",
-            "batch_size",
-            "lr",
-            "weight_decay",
-            "val_fraction",
-            "seed",
-            "temporal_downsample",
-            "target_sigma_bins",
-            "target_source",
-            "no_log_counts",
-            "tv_weight",
-        ),
+        SUPERVISED_RESUME_SIGNATURE_FIELDS,
     )
 
     if args.resume_checkpoint is not None:
         try:
             checkpoint = load_and_validate_resume(
                 args.resume_checkpoint,
-                map_location=device,
+                # RNG snapshots must remain CPU tensors; load_state_dict moves
+                # model and optimizer tensors to the selected device safely.
+                map_location="cpu",
                 dataset_hash=dataset_hash,
                 signature=signature,
                 requested_epochs=args.epochs,

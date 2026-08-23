@@ -14,9 +14,11 @@ from .errors import ExtractionError
 DEFAULT_MAX_MEMBERS = 200_000
 DEFAULT_MAX_COMPRESSION_RATIO = 1_000
 _WINDOWS_DEVICE_NAMES = {
-    "CON", "PRN", "AUX", "NUL",
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
     *(f"COM{index}" for index in range(1, 10)),
     *(f"LPT{index}" for index in range(1, 10)),
+    *(f"COM{index}" for index in "¹²³"),
+    *(f"LPT{index}" for index in "¹²³"),
 }
 
 

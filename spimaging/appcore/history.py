@@ -12,7 +12,12 @@ from typing import Iterable
 import uuid
 
 from spimaging.appcore.config import RunConfig
-from spimaging.appcore.storage import RUN_STATUSES, ResultManifest, now_iso
+from spimaging.appcore.storage import (
+    RUN_STATUSES,
+    ResultManifest,
+    finalize_stale_run,
+    now_iso,
+)
 
 
 @dataclass(frozen=True)
@@ -140,15 +145,31 @@ class HistoryStore:
 
     def mark_interrupted(self) -> int:
         with closing(self._connect()) as connection:
-            cursor = connection.execute(
+            active = connection.execute(
                 """
-                UPDATE runs SET status='interrupted', updated_at=?
+                SELECT run_id, run_dir FROM runs
                 WHERE status IN ('preparing', 'running', 'cancelling')
-                """,
-                (now_iso(),),
-            )
+                """
+            ).fetchall()
+        recovered: dict[str, str] = {}
+        for row in active:
+            try:
+                recovered[row["run_id"]] = finalize_stale_run(
+                    row["run_dir"],
+                    "interrupted",
+                    expected_run_id=row["run_id"],
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                recovered[row["run_id"]] = "interrupted"
+        with closing(self._connect()) as connection:
+            updated_at = now_iso()
+            for run_id, status in recovered.items():
+                connection.execute(
+                    "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
+                    (status, updated_at, run_id),
+                )
             connection.commit()
-            return cursor.rowcount
+            return len(recovered)
 
     def rebuild(self, run_roots: Iterable[str | Path]) -> tuple[int, list[str]]:
         imported = 0

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -50,6 +52,12 @@ class SharedNumericTypeTests(unittest.TestCase):
         self.assertEqual(self.cli.positive_odd_int("1"), 1)
         self.assertEqual(self.cli.positive_odd_int("3"), 3)
         self.assert_rejected(self.cli.positive_odd_int, "0", "2")
+        self.assertEqual(self.cli.model_base_channels("256"), 256)
+        self.assertEqual(self.cli.model_num_blocks("100"), 100)
+        self.assertEqual(self.cli.super_resolution_scale("64"), 64)
+        self.assert_rejected(self.cli.model_base_channels, "257")
+        self.assert_rejected(self.cli.model_num_blocks, "101")
+        self.assert_rejected(self.cli.super_resolution_scale, "65")
 
     def test_float_boundaries(self) -> None:
         self.assertEqual(self.cli.positive_float("0.001"), 0.001)
@@ -541,11 +549,12 @@ class CliContractTests(unittest.TestCase):
 
     def test_generation_publish_removes_only_stale_owned_outputs(self) -> None:
         from spimaging.generation.pipeline import build_parser, publish_generated_output
+        from spimaging.generation.recovery import partial_directory_for
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             output_dir = root / "output"
-            staging_dir = root / "staging"
+            staging_dir = partial_directory_for(output_dir)
             output_dir.mkdir()
             staging_dir.mkdir()
             (output_dir / "sample_00000.npz").write_bytes(b"old zero")
@@ -554,6 +563,23 @@ class CliContractTests(unittest.TestCase):
             (output_dir / "keep.txt").write_text("keep", encoding="utf-8")
             (staging_dir / "sample_00000.npz").write_bytes(b"new zero")
             (staging_dir / "index.csv").write_text("new index", encoding="utf-8")
+            (staging_dir / "generation_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "complete",
+                        "sample_count": 1,
+                        "completed": [
+                            {
+                                "file": "sample_00000.npz",
+                                "bytes": len(b"new zero"),
+                                "sha256": hashlib.sha256(b"new zero").hexdigest(),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             publish_generated_output(build_parser(), staging_dir, output_dir, overwrite=True)
 

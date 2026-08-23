@@ -144,6 +144,10 @@ def unpacked_size(archive: Path) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", required=True)
+    parser.add_argument(
+        "--runtime-version",
+        help="independently versioned CPU/CUDA layer (defaults to --version)",
+    )
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--cpu-archive", type=Path, required=True)
     parser.add_argument("--cuda-archive", type=Path)
@@ -153,12 +157,13 @@ def main() -> int:
     parser.add_argument("--signer-thumbprint")
     parser.add_argument("--min-nvidia-driver", default="550.0")
     args = parser.parse_args()
+    runtime_version = args.runtime_version or args.version
     archives = [args.cpu_archive, args.app_archive] + ([args.cuda_archive] if args.cuda_archive else [])
     policies = {path: signature_policy(args, path) for path in archives}
     assets = [
         asset(
             args.cpu_archive,
-            version=args.version,
+            version=runtime_version,
             component="runtime",
             variant="cpu",
             base_url=args.base_url,
@@ -179,7 +184,7 @@ def main() -> int:
         assets.append(
             asset(
                 args.cuda_archive,
-                version=args.version,
+                version=runtime_version,
                 component="runtime",
                 variant="cuda",
                 base_url=args.base_url,

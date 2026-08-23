@@ -9,6 +9,7 @@ import pytest
 from spimaging.appcore.config import RunConfig
 from spimaging.appcore.events import EventType, WorkerEvent
 from spimaging.appcore.storage import RunStorage
+from spimaging.generation.recovery import partial_directory_for
 from spimaging.desktop.models import (
     ApplicationPaths,
     DesktopSettings,
@@ -46,7 +47,8 @@ def _result_run(tmp_path: Path, *, labeled: bool) -> Path:
         run_dir,
         input={"dataset_paths": [str(dataset)]},
         training={"enabled": False},
-        prediction={"enabled": True},
+        prediction={"enabled": False},
+        evaluation={"enabled": False},
         visualization={"sample_count": 4},
     )
     storage = RunStorage(config)
@@ -82,12 +84,36 @@ def test_parameter_states_follow_registry_and_presets() -> None:
     training = ParameterFormState("reconstruction", "simple3d", preset="quick")
     assert training.resolved_values()["epochs"] == 1
     assert training.resolved_values()["max_samples"] == 2
+    assert training.resolved_values()["base_channels"] == 2
+    assert training.resolved_values()["temporal_downsample"] == 64
     training.set_algorithm("spisr")
     resolved = training.resolved_values()
     assert resolved["time_scale"] == 2
     assert "tv_weight" not in resolved
     training.apply_preset("standard")
     assert training.resolved_values()["epochs"] == 20
+    assert training.resolved_values()["weight_decay"] == pytest.approx(1e-6)
+    training.set_algorithm("simple3d")
+    assert training.resolved_values()["weight_decay"] == pytest.approx(1e-5)
+    assert training.resolved_values()["base_channels"] == 8
+    assert training.resolved_values()["temporal_downsample"] == 1
+
+    volume = ParameterFormState("simulation", "volume_scattering")
+    volume_values = volume.resolved_values()
+    assert volume_values["volume_extinction_coeff"] is None
+    assert volume_values["volume_backscatter_ratio"] is None
+    visible = {item.name for item in volume.visible_specs(include_advanced=True)}
+    assert "volume_fog_front_boost" in visible
+    assert "volume_water_front_boost" not in visible
+
+    translucent = ParameterFormState("simulation", "translucent_layer")
+    visible = {item.name for item in translucent.visible_specs(include_advanced=True)}
+    assert "translucent_front_depth_x_slope" not in visible
+    assert "translucent_front_depth_amplitude" not in visible
+    translucent.set_value("translucent_front_type", "sloped")
+    visible = {item.name for item in translucent.visible_specs(include_advanced=True)}
+    assert "translucent_front_depth_x_slope" in visible
+    assert "translucent_front_depth_amplitude" not in visible
 
 
 def test_experiment_request_round_trips_through_run_config(tmp_path: Path) -> None:
@@ -188,6 +214,59 @@ def test_resume_clone_only_increases_target_epochs(tmp_path: Path) -> None:
     assert cloned.training.resolved_parameters()["epochs"] == 2
     with pytest.raises(ValueError, match="必须大于"):
         clone_run_config(original, tmp_path / "bad", resume_checkpoint=checkpoint, target_epochs=1)
+
+
+def test_training_resume_reuses_original_generated_dataset(tmp_path: Path) -> None:
+    source = tmp_path / "source.mat"
+    source.write_bytes(b"source")
+    original_run = tmp_path / "generated-run"
+    original = RunConfig.new(
+        "full_pipeline",
+        original_run,
+        input={"source_path": str(source)},
+        generation={"enabled": True},
+        training={"enabled": True, "model": "simple3d", "preset": "quick"},
+    )
+    dataset = original_run / "artifacts" / "dataset"
+    dataset.mkdir(parents=True)
+    _sample(dataset / "sample_00000.npz")
+    checkpoint = original_run / "checkpoints" / "cancelled.pt"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"placeholder")
+
+    cloned = clone_run_config(
+        original,
+        tmp_path / "resumed-run",
+        resume_checkpoint=checkpoint,
+    )
+
+    assert cloned.generation.enabled is False
+    assert cloned.generation.resume is False
+    assert cloned.input.dataset_paths == (str(dataset.resolve()),)
+    assert cloned.evaluation.dataset_dir == str(dataset.resolve())
+
+
+def test_generation_partial_is_resumed_in_the_original_run(tmp_path: Path) -> None:
+    source = tmp_path / "source.mat"
+    source.write_bytes(b"source")
+    run_dir = tmp_path / "generation-run"
+    config = RunConfig.new(
+        "generate",
+        run_dir,
+        input={"source_path": str(source)},
+        generation={"enabled": True, "resume": True},
+    )
+    storage = RunStorage(config)
+    manifest = storage.prepare()
+    manifest.set_status("cancelled")
+    storage.write_result(manifest)
+    partial = partial_directory_for(run_dir / "artifacts" / "dataset")
+    partial.mkdir(parents=True)
+
+    model = ResultGalleryModel.load(run_dir)
+
+    assert model.generation_resume_directory() == partial
+    assert model.resume_available()
 
 
 def test_settings_round_trip_and_corruption_fallback(tmp_path: Path) -> None:

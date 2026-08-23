@@ -11,6 +11,8 @@ from spimaging.cli import (
     add_device_arguments,
     create_output_directory,
     fraction,
+    model_base_channels,
+    model_num_blocks,
     nonnegative_float,
     nonnegative_int,
     positive_float,
@@ -18,6 +20,7 @@ from spimaging.cli import (
     random_seed,
     require_dataset_path,
     require_file,
+    super_resolution_scale,
     validate_npz_archive,
     validate_output_directory,
 )
@@ -98,25 +101,25 @@ def build_parser():
     )
     parser.add_argument(
         "--base_channels",
-        type=positive_int,
+        type=model_base_channels,
         default=16,
         help="Number of base feature channels in the network (>= 1).",
     )
     parser.add_argument(
         "--num_blocks",
-        type=positive_int,
+        type=model_num_blocks,
         default=4,
         help="Number of residual processing blocks (>= 1).",
     )
     parser.add_argument(
         "--time_scale",
-        type=positive_int,
+        type=super_resolution_scale,
         default=2,
         help="Longitudinal super-resolution factor (>= 1).",
     )
     parser.add_argument(
         "--spatial_scale",
-        type=positive_int,
+        type=super_resolution_scale,
         default=2,
         help="Lateral super-resolution factor (>= 1).",
     )
@@ -269,14 +272,23 @@ def run_epoch(
 ):
     import torch
     from tqdm import tqdm
-    from spimaging.training_common.events import emit_event, raise_if_cancelled
+    from spimaging.training_common.events import (
+        emit_event,
+        raise_if_cancelled,
+        structured_events_enabled,
+    )
 
     model.train(train)
     totals = {"loss": 0.0, "pukl": 0.0, "equivariance": 0.0}
     n_items = 0
 
     for batch_idx, batch in enumerate(
-        tqdm(loader, desc="train" if train else "val", leave=False),
+        tqdm(
+            loader,
+            desc="train" if train else "val",
+            leave=False,
+            disable=structured_events_enabled(),
+        ),
         start=1,
     ):
         if batch_idx <= int(start_batch):
@@ -459,7 +471,9 @@ def main(argv=None, *, event_callback=None, cancel_check=None):
         try:
             checkpoint = load_and_validate_resume(
                 args.resume_checkpoint,
-                map_location=device,
+                # RNG snapshots must remain CPU tensors; load_state_dict moves
+                # model and optimizer tensors to the selected device safely.
+                map_location="cpu",
                 dataset_hash=dataset_hash,
                 signature=signature,
                 requested_epochs=args.epochs,

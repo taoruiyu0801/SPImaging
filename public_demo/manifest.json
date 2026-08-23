@@ -1,6 +1,6 @@
 {
   "checkpoint": {
-    "bytes": 11029,
+    "bytes": 10546,
     "method_family": "supervised",
     "model_name": "simple3d",
     "path": "checkpoint/simple3d_synthetic.pt",
@@ -16,7 +16,7 @@
       "seed": 2026082301,
       "target_sigma_bins": 0.75,
       "temporal_downsample": 64,
-      "torch_version": "2.11.0+cu130",
+      "torch_version": "2.5.1",
       "training_sample_sha256": [
         "ff08d79843a8ef79ebce181ecd333a682245fa4093f282dcd1f51d9694718a6c",
         "a2c22005fdfb5f38782bf68ca4a2870584a26ca2be5fb2d1870580ab4bd43a57",
@@ -25,7 +25,7 @@
       ],
       "training_spatial_stride": 2
     },
-    "sha256": "cf8021a68b110fd928056e46f084c1886263b2c86be1888830d4a22096c9e3fe",
+    "sha256": "d48af9828f304fa20e2949bf199ea9ba128365d349d9f90fb115134916d1bb06",
     "status": "generated"
   },
   "dataset": {
@@ -176,7 +176,7 @@
     "name": "SPImaging analytic synthetic demo generator",
     "numpy": "1.26.4",
     "path": "scripts/generate_synthetic_demo.py",
-    "python": "3.10.20",
+    "python": "3.10.21",
     "sha256": "d87ede09c253bb560a9bbd1361d94d0b634c813d6e07fae70544c9c940d70ab0",
     "version": "1.0.0"
   },

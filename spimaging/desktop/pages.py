@@ -191,8 +191,8 @@ class HomePage(QWidget):
         for row, record in enumerate(self._records):
             values = (
                 record.display_name,
-                WORKFLOW_LABELS.get(record.workflow, record.workflow),
-                STATUS_LABELS.get(record.status, record.status),
+                tr("WorkflowLabels", WORKFLOW_LABELS.get(record.workflow, record.workflow)),
+                tr("StatusLabels", STATUS_LABELS.get(record.status, record.status)),
                 record.updated_at,
             )
             for column, value in enumerate(values):
@@ -239,7 +239,7 @@ class ExperimentPage(QWidget):
         self.workflow_combo = QComboBox()
         self.workflow_combo.setObjectName("workflowCombo")
         for key in ("full_pipeline", "generate", "inspect", "train", "predict", "evaluate"):
-            self.workflow_combo.addItem(WORKFLOW_LABELS[key], key)
+            self.workflow_combo.addItem(tr("WorkflowLabels", WORKFLOW_LABELS[key]), key)
         self.dataset_picker = PathPicker(mode="directory", placeholder=tr("ExperimentPage", "已有 NPZ 数据集目录"))
         self.sample_picker = PathPicker(
             mode="open_file", file_filter="NPZ (*.npz)", placeholder=tr("ExperimentPage", "单样本预测文件")
@@ -351,7 +351,7 @@ class ExperimentPage(QWidget):
         self.device_combo = QComboBox()
         self.device_combo.setObjectName("deviceCombo")
         for key, label in DEVICE_LABELS.items():
-            self.device_combo.addItem(label, key)
+            self.device_combo.addItem(tr("DeviceLabels", label), key)
         self.device_combo.setCurrentIndex(max(0, self.device_combo.findData(settings.device)))
         self.gpu_spin = QSpinBox()
         self.gpu_spin.setRange(0, 31)
@@ -639,7 +639,7 @@ class RunPage(QWidget):
         self.cancel_button.setEnabled(False)
         self.result_button = QPushButton(tr("RunPage", "打开结果"))
         self.result_button.setEnabled(False)
-        self.resume_button = QPushButton(tr("RunPage", "恢复训练"))
+        self.resume_button = QPushButton(tr("RunPage", "恢复任务"))
         self.resume_button.setEnabled(False)
         controls.addWidget(self.cancel_button)
         controls.addStretch(1)
@@ -683,7 +683,9 @@ class RunPage(QWidget):
         self.run_dir = config.output.run_dir
         self.run_name.setText(config.display_name)
         self.status_badge.set_status("preparing")
-        self.stage_label.setText(WORKFLOW_LABELS.get(config.workflow, config.workflow))
+        self.stage_label.setText(
+            tr("WorkflowLabels", WORKFLOW_LABELS.get(config.workflow, config.workflow))
+        )
         self.progress_bar.setValue(0)
         self.log_view.clear()
         self.cancel_button.setEnabled(True)
@@ -696,7 +698,9 @@ class RunPage(QWidget):
         detail = state.stage
         if state.total:
             detail += f" · {state.current}/{state.total}"
-        self.stage_label.setText(detail or STATUS_LABELS.get(state.status, state.status))
+        self.stage_label.setText(
+            detail or tr("StatusLabels", STATUS_LABELS.get(state.status, state.status))
+        )
         self.progress_bar.setValue(state.percent)
         loss = {key: points for key, points in state.metrics.items() if "loss" in key.lower()}
         metrics = {key: points for key, points in state.metrics.items() if any(token in key.lower() for token in ("mae", "rmse", "absrel"))}
@@ -716,8 +720,15 @@ class RunPage(QWidget):
         self.status_badge.set_status(status)
         self.cancel_button.setEnabled(False)
         self.result_button.setEnabled(bool(self.run_dir and Path(self.run_dir, "result_manifest.json").is_file()))
-        self.resume_button.setEnabled(status in RESUMABLE_STATUSES)
-        self._append_log(f"[{STATUS_LABELS.get(status, status)}] worker exit code: {exit_code}")
+        can_resume = False
+        if status in RESUMABLE_STATUSES and self.run_dir:
+            try:
+                can_resume = ResultGalleryModel.load(self.run_dir).resume_available()
+            except ValueError:
+                pass
+        self.resume_button.setEnabled(can_resume)
+        status_label = tr("StatusLabels", STATUS_LABELS.get(status, status))
+        self._append_log(f"[{status_label}] worker exit code: {exit_code}")
 
 
 class ResultsPage(QWidget):
@@ -748,7 +759,7 @@ class ResultsPage(QWidget):
         self.count_spin.setValue(4)
         self.count_spin.valueChanged.connect(self.refresh_gallery)
         self.reuse_button = QPushButton(tr("ResultsPage", "复用配置"))
-        self.resume_button = QPushButton(tr("ResultsPage", "恢复训练"))
+        self.resume_button = QPushButton(tr("ResultsPage", "恢复任务"))
         self.export_button = QPushButton(tr("ResultsPage", "导出结果…"))
         self.reuse_button.setEnabled(False)
         self.resume_button.setEnabled(False)
@@ -809,7 +820,7 @@ class ResultsPage(QWidget):
         self.count_spin.setValue(self.model.config.visualization.sample_count)
         self.reuse_button.setEnabled(True)
         self.export_button.setEnabled(True)
-        self.resume_button.setEnabled(self.model.compatible_resume_checkpoint() is not None)
+        self.resume_button.setEnabled(self.model.resume_available())
         self._populate_artifacts()
         self.refresh_gallery()
 
@@ -933,7 +944,7 @@ class HistoryPage(QWidget):
         actions = QHBoxLayout()
         self.open_button = QPushButton(tr("HistoryPage", "打开结果"))
         self.reuse_button = QPushButton(tr("HistoryPage", "复用配置"))
-        self.resume_button = QPushButton(tr("HistoryPage", "恢复训练"))
+        self.resume_button = QPushButton(tr("HistoryPage", "恢复任务"))
         for button in (self.open_button, self.reuse_button, self.resume_button):
             button.setEnabled(False)
         actions.addStretch(1)
@@ -954,8 +965,8 @@ class HistoryPage(QWidget):
         for row, record in enumerate(self.records):
             values = (
                 record.display_name,
-                WORKFLOW_LABELS.get(record.workflow, record.workflow),
-                STATUS_LABELS.get(record.status, record.status),
+                tr("WorkflowLabels", WORKFLOW_LABELS.get(record.workflow, record.workflow)),
+                tr("StatusLabels", STATUS_LABELS.get(record.status, record.status)),
                 record.created_at,
                 record.run_dir,
             )
@@ -984,7 +995,13 @@ class HistoryPage(QWidget):
         record = self._selected()
         self.open_button.setEnabled(record is not None)
         self.reuse_button.setEnabled(record is not None and Path(record.run_dir, "run.json").is_file())
-        self.resume_button.setEnabled(record is not None and record.status in RESUMABLE_STATUSES)
+        can_resume = False
+        if record is not None and record.status in RESUMABLE_STATUSES:
+            try:
+                can_resume = ResultGalleryModel.load(record.run_dir).resume_available()
+            except ValueError:
+                pass
+        self.resume_button.setEnabled(can_resume)
 
     def _open(self) -> None:
         record = self._selected()
@@ -1053,7 +1070,7 @@ class SettingsPage(QWidget):
         device_form = QFormLayout()
         self.device_combo = QComboBox()
         for key, label in DEVICE_LABELS.items():
-            self.device_combo.addItem(label, key)
+            self.device_combo.addItem(tr("DeviceLabels", label), key)
         self.device_combo.setCurrentIndex(max(0, self.device_combo.findData(settings.device)))
         self.gpu_spin = QSpinBox()
         self.gpu_spin.setRange(0, 31)

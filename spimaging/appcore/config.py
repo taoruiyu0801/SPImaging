@@ -35,27 +35,43 @@ def _now() -> str:
 
 
 def _tuple_of_strings(value: Any, label: str) -> tuple[str, ...]:
-    if value is None:
-        return ()
     if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"{label}必须是文本列表")
     return tuple(value)
 
 
 def _mapping(value: Any, label: str) -> dict[str, Any]:
-    if value is None:
-        return {}
     if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
         raise ValueError(f"{label}必须是对象")
     return dict(value)
 
 
-def _bool_value(value: Any, label: str, default: bool) -> bool:
-    if value is None:
-        return default
+def _bool_value(value: Any, label: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{label}必须是布尔值")
     return value
+
+
+def _integer_value(value: Any, label: str) -> int:
+    """Return a schema integer without truncating floats or accepting bools."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label}必须是整数")
+    return value
+
+
+def _text_value(value: Any, label: str) -> str:
+    """Return schema text without stringifying arbitrary Python/JSON values."""
+
+    if not isinstance(value, str):
+        raise ValueError(f"{label}必须是文本")
+    return value
+
+
+def _optional_text_value(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    return _text_value(value, label)
 
 
 def _section(data: Mapping[str, Any], key: str) -> dict[str, Any]:
@@ -63,6 +79,8 @@ def _section(data: Mapping[str, Any], key: str) -> dict[str, Any]:
 
 
 def _reject_unknown(data: Mapping[str, Any], allowed: set[str], label: str) -> None:
+    if not all(isinstance(key, str) for key in data):
+        raise ValueError(f"{label}字段名必须是文本")
     unknown = sorted(set(data) - allowed)
     if unknown:
         raise ValueError(f"{label}包含未知字段：{', '.join(unknown)}")
@@ -83,18 +101,14 @@ class InputConfig:
             {"dataset_paths", "source_path", "sample_file", "checkpoint_paths", "checkpoint_labels"},
             "input",
         )
-        source_path = data.get("source_path")
-        sample_file = data.get("sample_file")
-        if source_path is not None and not isinstance(source_path, str):
-            raise ValueError("input.source_path 必须是文本或 null")
-        if sample_file is not None and not isinstance(sample_file, str):
-            raise ValueError("input.sample_file 必须是文本或 null")
+        source_path = _optional_text_value(data.get("source_path"), "input.source_path")
+        sample_file = _optional_text_value(data.get("sample_file"), "input.sample_file")
         result = cls(
-            dataset_paths=_tuple_of_strings(data.get("dataset_paths"), "input.dataset_paths"),
+            dataset_paths=_tuple_of_strings(data.get("dataset_paths", ()), "input.dataset_paths"),
             source_path=source_path,
             sample_file=sample_file,
-            checkpoint_paths=_tuple_of_strings(data.get("checkpoint_paths"), "input.checkpoint_paths"),
-            checkpoint_labels=_tuple_of_strings(data.get("checkpoint_labels"), "input.checkpoint_labels"),
+            checkpoint_paths=_tuple_of_strings(data.get("checkpoint_paths", ()), "input.checkpoint_paths"),
+            checkpoint_labels=_tuple_of_strings(data.get("checkpoint_labels", ()), "input.checkpoint_labels"),
         )
         if result.checkpoint_labels and len(result.checkpoint_labels) != len(result.checkpoint_paths):
             raise ValueError("checkpoint_labels 数量必须与 checkpoint_paths 相同")
@@ -113,11 +127,11 @@ class GenerationConfig:
     def from_dict(cls, data: Mapping[str, Any]) -> "GenerationConfig":
         _reject_unknown(data, {"enabled", "dataset_mode", "surface_model", "parameters", "resume"}, "generation")
         result = cls(
-            enabled=_bool_value(data.get("enabled"), "generation.enabled", False),
-            dataset_mode=str(data.get("dataset_mode", "raw")),
-            surface_model=str(data.get("surface_model", "single")),
-            parameters=_mapping(data.get("parameters"), "generation.parameters"),
-            resume=_bool_value(data.get("resume"), "generation.resume", True),
+            enabled=_bool_value(data.get("enabled", False), "generation.enabled"),
+            dataset_mode=_text_value(data.get("dataset_mode", "raw"), "generation.dataset_mode"),
+            surface_model=_text_value(data.get("surface_model", "single"), "generation.surface_model"),
+            parameters=_mapping(data.get("parameters", {}), "generation.parameters"),
+            resume=_bool_value(data.get("resume", True), "generation.resume"),
         )
         result.validate()
         return result
@@ -146,14 +160,14 @@ class TrainingConfig:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "TrainingConfig":
         _reject_unknown(data, {"enabled", "model", "preset", "parameters", "resume_checkpoint"}, "training")
-        checkpoint = data.get("resume_checkpoint")
-        if checkpoint is not None and not isinstance(checkpoint, str):
-            raise ValueError("training.resume_checkpoint 必须是文本或 null")
+        checkpoint = _optional_text_value(
+            data.get("resume_checkpoint"), "training.resume_checkpoint"
+        )
         result = cls(
-            enabled=_bool_value(data.get("enabled"), "training.enabled", False),
-            model=str(data.get("model", "simple3d")),
-            preset=str(data.get("preset", "quick")),
-            parameters=_mapping(data.get("parameters"), "training.parameters"),
+            enabled=_bool_value(data.get("enabled", False), "training.enabled"),
+            model=_text_value(data.get("model", "simple3d"), "training.model"),
+            preset=_text_value(data.get("preset", "quick"), "training.preset"),
+            parameters=_mapping(data.get("parameters", {}), "training.parameters"),
             resume_checkpoint=checkpoint,
         )
         validate_training_parameters(result.model, result.preset, result.parameters)
@@ -172,13 +186,13 @@ class PredictionConfig:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "PredictionConfig":
         _reject_unknown(data, {"enabled", "checkpoint", "sample_file"}, "prediction")
-        checkpoint = data.get("checkpoint")
-        sample_file = data.get("sample_file")
-        if checkpoint is not None and not isinstance(checkpoint, str):
-            raise ValueError("prediction.checkpoint 必须是文本或 null")
-        if sample_file is not None and not isinstance(sample_file, str):
-            raise ValueError("prediction.sample_file 必须是文本或 null")
-        return cls(_bool_value(data.get("enabled"), "prediction.enabled", False), checkpoint, sample_file)
+        checkpoint = _optional_text_value(data.get("checkpoint"), "prediction.checkpoint")
+        sample_file = _optional_text_value(data.get("sample_file"), "prediction.sample_file")
+        return cls(
+            _bool_value(data.get("enabled", False), "prediction.enabled"),
+            checkpoint,
+            sample_file,
+        )
 
 
 @dataclass(frozen=True)
@@ -192,15 +206,13 @@ class EvaluationConfig:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "EvaluationConfig":
         _reject_unknown(data, {"enabled", "checkpoints", "labels", "dataset_dir", "figure_index"}, "evaluation")
-        dataset_dir = data.get("dataset_dir")
-        if dataset_dir is not None and not isinstance(dataset_dir, str):
-            raise ValueError("evaluation.dataset_dir 必须是文本或 null")
+        dataset_dir = _optional_text_value(data.get("dataset_dir"), "evaluation.dataset_dir")
         result = cls(
-            enabled=_bool_value(data.get("enabled"), "evaluation.enabled", False),
-            checkpoints=_tuple_of_strings(data.get("checkpoints"), "evaluation.checkpoints"),
-            labels=_tuple_of_strings(data.get("labels"), "evaluation.labels"),
+            enabled=_bool_value(data.get("enabled", False), "evaluation.enabled"),
+            checkpoints=_tuple_of_strings(data.get("checkpoints", ()), "evaluation.checkpoints"),
+            labels=_tuple_of_strings(data.get("labels", ()), "evaluation.labels"),
             dataset_dir=dataset_dir,
-            figure_index=int(data.get("figure_index", 0)),
+            figure_index=_integer_value(data.get("figure_index", 0), "evaluation.figure_index"),
         )
         if result.figure_index < 0:
             raise ValueError("evaluation.figure_index 不能为负数")
@@ -220,8 +232,14 @@ class VisualizationConfig:
         raw_indices = data.get("sample_indices", ())
         if not isinstance(raw_indices, (list, tuple)):
             raise ValueError("visualization.sample_indices 必须是整数列表")
-        indices = tuple(int(index) for index in raw_indices)
-        result = cls(int(data.get("sample_count", 4)), indices)
+        indices = tuple(
+            _integer_value(index, f"visualization.sample_indices[{position}]")
+            for position, index in enumerate(raw_indices)
+        )
+        result = cls(
+            _integer_value(data.get("sample_count", 4), "visualization.sample_count"),
+            indices,
+        )
         if not 1 <= result.sample_count <= 12:
             raise ValueError("可视化样本数必须在 1 到 12 之间")
         if any(index < 0 for index in result.sample_indices):
@@ -239,7 +257,10 @@ class ComputeConfig:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ComputeConfig":
         _reject_unknown(data, {"preference", "gpu_index"}, "compute")
-        result = cls(str(data.get("preference", "auto")), int(data.get("gpu_index", 0)))
+        result = cls(
+            _text_value(data.get("preference", "auto"), "compute.preference"),
+            _integer_value(data.get("gpu_index", 0), "compute.gpu_index"),
+        )
         if result.preference not in COMPUTE_PREFERENCES:
             raise ValueError(f"未知设备偏好：{result.preference}")
         if result.gpu_index < 0:
@@ -255,12 +276,10 @@ class OutputConfig:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "OutputConfig":
         _reject_unknown(data, {"run_dir", "history_db"}, "output")
-        run_dir = data.get("run_dir")
-        history_db = data.get("history_db")
-        if not isinstance(run_dir, str) or not run_dir.strip():
+        run_dir = _text_value(data.get("run_dir"), "output.run_dir")
+        history_db = _optional_text_value(data.get("history_db"), "output.history_db")
+        if not run_dir.strip():
             raise ValueError("output.run_dir 不能为空")
-        if history_db is not None and not isinstance(history_db, str):
-            raise ValueError("output.history_db 必须是文本或 null")
         return cls(run_dir, history_db)
 
 
@@ -289,6 +308,9 @@ class RunConfig:
         display_name: str = "SPImaging 实验",
         **sections: Any,
     ) -> "RunConfig":
+        if isinstance(run_dir, bool) or not isinstance(run_dir, (str, Path)):
+            raise ValueError("run_dir 必须是文本或路径")
+        output_section = _mapping(sections.get("output", {}), "output")
         data = {
             "schema_version": RUN_CONFIG_SCHEMA_VERSION,
             "run_id": str(uuid.uuid4()),
@@ -302,12 +324,14 @@ class RunConfig:
             "evaluation": sections.get("evaluation", {}),
             "visualization": sections.get("visualization", {}),
             "compute": sections.get("compute", {}),
-            "output": {"run_dir": str(run_dir), **sections.get("output", {})},
+            "output": {"run_dir": str(run_dir), **output_section},
         }
         return cls.from_dict(data)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "RunConfig":
+        if not isinstance(data, Mapping):
+            raise ValueError("run config 必须是对象")
         _reject_unknown(
             data,
             {
@@ -317,21 +341,23 @@ class RunConfig:
             },
             "run config",
         )
-        schema_version = int(data.get("schema_version", 0))
+        schema_version = _integer_value(data.get("schema_version", 0), "schema_version")
         if schema_version != RUN_CONFIG_SCHEMA_VERSION:
             raise ValueError(f"不支持的 RunConfig schema_version：{schema_version}")
-        run_id = str(data.get("run_id", ""))
+        run_id = _text_value(data.get("run_id", ""), "run_id")
         try:
             uuid.UUID(run_id)
         except (ValueError, AttributeError) as exc:
             raise ValueError("run_id 必须是有效 UUID") from exc
-        workflow = str(data.get("workflow", ""))
+        workflow = _text_value(data.get("workflow", ""), "workflow")
         if workflow not in WORKFLOWS:
             raise ValueError(f"未知工作流：{workflow}")
-        created_at = str(data.get("created_at", ""))
+        created_at = _text_value(data.get("created_at", ""), "created_at")
         if not created_at:
             raise ValueError("created_at 不能为空")
-        display_name = str(data.get("display_name", "SPImaging 实验")).strip()
+        display_name = _text_value(
+            data.get("display_name", "SPImaging 实验"), "display_name"
+        ).strip()
         if not display_name:
             raise ValueError("display_name 不能为空")
         result = cls(
@@ -389,6 +415,15 @@ class RunConfig:
             raise ValueError("完整工作流需要已有数据集或启用数据生成")
         if self.workflow == "full_pipeline" and generated_dataset and not self.input.source_path:
             raise ValueError("启用数据生成时需要 input.source_path")
+        if self.workflow == "full_pipeline":
+            downstream_requested = self.prediction.enabled or self.evaluation.enabled
+            checkpoint_available = bool(
+                self.prediction.checkpoint
+                or self.evaluation.checkpoints
+                or self.input.checkpoint_paths
+            )
+            if downstream_requested and not self.training.enabled and not checkpoint_available:
+                raise ValueError("完整工作流未启用训练时，预测或评估需要 checkpoint")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

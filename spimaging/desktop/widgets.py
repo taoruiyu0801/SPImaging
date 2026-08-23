@@ -186,10 +186,11 @@ class DynamicParameterForm(QWidget):
         self._rows.clear()
         for spec in self.state.specs:
             control = self._create_control(spec, self.state.values.get(spec.name, spec.default))
-            label = QLabel(spec.label)
+            label = QLabel(tr("Parameters", spec.label))
             if spec.help:
-                label.setToolTip(spec.help)
-                control.setToolTip(spec.help)
+                help_text = tr("ParameterHelp", spec.help)
+                label.setToolTip(help_text)
+                control.setToolTip(help_text)
             form = self.advanced_form if spec.advanced else self.basic_form
             form.addRow(label, control)
             self.controls[spec.name] = control
@@ -212,20 +213,34 @@ class DynamicParameterForm(QWidget):
                 max(-2_147_483_647, minimum),
                 min(2_147_483_647, maximum),
             )
+            if spec.odd:
+                control.setSingleStep(2)
             control.setValue(int(value))
             control.valueChanged.connect(self._control_changed)
             return control
         if spec.kind is ParameterType.NUMBER:
             control = QDoubleSpinBox()
             control.setDecimals(15)
-            control.setRange(
-                float(spec.minimum if spec.minimum is not None else -1e100),
-                float(spec.maximum if spec.maximum is not None else 1e100),
-            )
-            numeric = float(value)
+            minimum = float(spec.minimum if spec.minimum is not None else -1e100)
+            maximum = float(spec.maximum if spec.maximum is not None else 1e100)
+            numeric = float(0.0 if value is None else value)
             step = 10 ** max(-12, math.floor(math.log10(abs(numeric))) - 1) if numeric else 0.01
+            if spec.nullable:
+                # Put the special null value exactly one editor step below the
+                # valid range so one increment reaches the real minimum.
+                sentinel = minimum - step
+                if not math.isfinite(sentinel) or sentinel < -1e100:
+                    raise ValueError(f"可空参数缺少可表示的最小值：{spec.name}")
+                control.setRange(sentinel, maximum)
+                control.setSpecialValueText(tr("DynamicParameterForm", "使用介质默认值"))
+                control.setProperty("spimagingNullableSentinel", sentinel)
+            else:
+                control.setRange(minimum, maximum)
             control.setSingleStep(step)
-            control.setValue(numeric)
+            if value is None:
+                control.setValue(float(control.property("spimagingNullableSentinel")))
+            else:
+                control.setValue(numeric)
             control.valueChanged.connect(self._control_changed)
             return control
         if spec.kind is ParameterType.CHOICE:
@@ -243,6 +258,10 @@ class DynamicParameterForm(QWidget):
         if isinstance(control, QCheckBox):
             return control.isChecked()
         if isinstance(control, (QSpinBox, QDoubleSpinBox)):
+            if isinstance(control, QDoubleSpinBox):
+                sentinel = control.property("spimagingNullableSentinel")
+                if sentinel is not None and control.value() == float(sentinel):
+                    return None
             return control.value()
         if isinstance(control, QComboBox):
             return control.currentText()
@@ -283,7 +302,7 @@ class StatusBadge(QLabel):
 
     def set_status(self, status: str) -> None:
         self.setProperty("status", status)
-        self.setText(STATUS_LABELS.get(status, status))
+        self.setText(tr("StatusLabels", STATUS_LABELS.get(status, status)))
         self.style().unpolish(self)
         self.style().polish(self)
 

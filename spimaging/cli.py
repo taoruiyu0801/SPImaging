@@ -100,6 +100,27 @@ def positive_odd_int(value: str) -> int:
     return number
 
 
+def model_base_channels(value: str) -> int:
+    number = positive_int(value)
+    if number > 256:
+        raise argparse.ArgumentTypeError("must be between 1 and 256")
+    return number
+
+
+def model_num_blocks(value: str) -> int:
+    number = positive_int(value)
+    if number > 100:
+        raise argparse.ArgumentTypeError("must be between 1 and 100")
+    return number
+
+
+def super_resolution_scale(value: str) -> int:
+    number = positive_int(value)
+    if number > 64:
+        raise argparse.ArgumentTypeError("must be between 1 and 64")
+    return number
+
+
 def add_device_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the shared explicit device controls without importing PyTorch."""
 

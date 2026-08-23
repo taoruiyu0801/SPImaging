@@ -115,9 +115,62 @@ class EventWriter:
         self.stream = stream
         self.event_path = Path(event_path) if event_path is not None else None
         self._seq = 0
+        self._needs_separator = False
         self._lock = threading.Lock()
         if self.event_path is not None:
             self.event_path.parent.mkdir(parents=True, exist_ok=True)
+            self._seq, self._needs_separator = self._load_existing_sequence()
+
+    def _load_existing_sequence(self) -> tuple[int, bool]:
+        """Continue one run's JSONL sequence without rewriting prior events."""
+
+        assert self.event_path is not None
+        try:
+            size = self.event_path.stat().st_size
+        except FileNotFoundError:
+            return 0, False
+        if size == 0:
+            return 0, False
+
+        with self.event_path.open("rb") as handle:
+            handle.seek(-1, 2)
+            needs_separator = handle.read(1) not in {b"\n", b"\r"}
+            handle.seek(0)
+            sequence = 0
+            offset = 0
+            truncate_at: int | None = None
+            for line_number, raw_line in enumerate(handle, 1):
+                line_start = offset
+                offset += len(raw_line)
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                try:
+                    decoded = stripped.decode("utf-8")
+                    data = json.loads(decoded)
+                    if not isinstance(data, Mapping):
+                        raise ValueError("事件必须是 JSON 对象")
+                    event = WorkerEvent.from_dict(data)
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                    # A hard process termination can leave only the final JSON
+                    # object partially written. Drop only those incomplete tail
+                    # bytes so this and every later restart remain readable.
+                    if offset == size and needs_separator:
+                        truncate_at = line_start
+                        needs_separator = False
+                        break
+                    raise ValueError(
+                        f"现有事件文件第 {line_number} 行无效：{exc}"
+                    ) from exc
+                if event.run_id != self.run_id:
+                    raise ValueError("现有事件文件属于另一个 run_id")
+                if event.seq != sequence + 1:
+                    raise ValueError("现有事件序号不连续")
+                sequence = event.seq
+        if truncate_at is not None:
+            with self.event_path.open("r+b") as handle:
+                handle.truncate(truncate_at)
+        return sequence, needs_separator
 
     def emit(
         self,
@@ -130,10 +183,12 @@ class EventWriter:
             line = event.to_json() + "\n"
             if self.event_path is not None:
                 with self.event_path.open("a", encoding="utf-8", newline="\n") as handle:
+                    if self._needs_separator:
+                        handle.write("\n")
+                        self._needs_separator = False
                     handle.write(line)
                     handle.flush()
             if self.stream is not None:
                 self.stream.write(line)
                 self.stream.flush()
             return event
-

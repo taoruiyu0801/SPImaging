@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$Version = "0.2.0-beta.1",
+    [string]$RuntimeVersion = $Version,
     [Parameter(Mandatory = $true)]
     [string]$BaseUrl,
     [string]$OutputDirectory = (Join-Path $PSScriptRoot "..\out"),
@@ -10,14 +11,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
-$cpu = Join-Path $outputRoot "spimaging-runtime-cpu-$Version.zip"
-$cuda = Join-Path $outputRoot "spimaging-runtime-cuda-$Version.zip"
+$cpu = Join-Path $outputRoot "spimaging-runtime-cpu-$RuntimeVersion.zip"
+$cuda = Join-Path $outputRoot "spimaging-runtime-cuda-$RuntimeVersion.zip"
 $app = Join-Path $outputRoot "spimaging-app-$Version.zip"
 $manifest = Join-Path $outputRoot "spimaging-release-manifest.json"
 
 $arguments = @(
     (Join-Path $PSScriptRoot "build_release_manifest.py"),
     "--version", $Version,
+    "--runtime-version", $RuntimeVersion,
     "--base-url", $BaseUrl,
     "--cpu-archive", $cpu,
     "--app-archive", $app,

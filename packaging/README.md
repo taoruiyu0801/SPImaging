@@ -19,11 +19,11 @@ the output name and manifest remain explicitly marked `unsigned-beta`.
 
 ```powershell
 packaging/scripts/New-RuntimeLocks.ps1
-packaging/scripts/Build-Runtime.ps1 -Variant cpu
-packaging/scripts/Build-Runtime.ps1 -Variant cuda
+packaging/scripts/Build-Runtime.ps1 -Variant cpu -Version 0.2.0-runtime.1
+packaging/scripts/Build-Runtime.ps1 -Variant cuda -Version 0.2.0-runtime.1
 packaging/scripts/Build-AppAsset.ps1
 packaging/scripts/Build-Launcher.ps1
-packaging/scripts/New-ReleaseManifest.ps1 -Version 0.2.0-beta.1 -BaseUrl https://github.com/ewellchen/SPImaging/releases/download/v0.2.0-beta.1
+packaging/scripts/New-ReleaseManifest.ps1 -Version 0.2.0-beta.1 -RuntimeVersion 0.2.0-runtime.1 -BaseUrl https://github.com/ewellchen/SPImaging/releases/download/v0.2.0-beta.1
 packaging/scripts/Build-Installer.ps1 -Version 0.2.0-beta.1
 ```
 
@@ -38,6 +38,13 @@ Use the following offline dry-run before publishing:
 python packaging/scripts/verify_release_manifest.py packaging/out/spimaging-release-manifest.json --asset-dir packaging/out
 ```
 
+Runtime versions are intentionally independent from application release
+versions. A release manifest may point at an unchanged `0.2.0-runtime.1` CPU/
+CUDA layer while advancing only the app to `0.2.0-beta.2`; the launcher records
+and updates those components separately. Formal publishing also creates
+`spimaging-release-manifest.json.p7s`. The signed launcher derives the expected
+CMS signer from its own Authenticode certificate before caching that manifest.
+
 The application asset builder includes only tracked `spimaging/`, synthetic
 `public_demo/`, `LICENSE`, `NOTICE`, `THIRD_PARTY_LICENSES.md`, and `SBOM.md`
 paths. It rejects the private `example_data/` and legacy `demo_checkpoint/`
@@ -49,3 +56,12 @@ trees.
 `SPImaging-Setup-unsigned-beta.exe`, Authenticode-signs that exact file through
 `Sign-Artifact.ps1`, then atomically renames it to `SPImaging-Setup.exe`. With no
 signing input, only the `-unsigned-beta` filename is produced.
+
+The launcher beta channel reads its rolling control file from the dedicated
+`windows-beta` GitHub release tag, because GitHub `releases/latest` excludes
+prereleases. The release-candidate workflow exposes two mutually exclusive,
+environment-approved publication paths: publisher-signed publication, or an
+explicit `publish_unsigned_beta` path that requires a prerelease SemVer, keeps
+the `SPImaging-Setup-unsigned-beta.exe` name, and updates only the beta channel
+manifest. Unsigned artifacts can never be published as a stable installer or
+stable-channel manifest.

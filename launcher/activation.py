@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from copy import deepcopy
 import json
 from pathlib import Path
 import os
@@ -17,7 +18,7 @@ from .errors import ActivationError, HealthCheckError
 from .manifest import HealthCheck
 
 
-_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,27 @@ class HealthResult:
     return_code: int
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True)
+class ActivationSnapshot:
+    """In-memory copy of the authoritative activation state."""
+
+    state_file_existed: bool
+    state: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ActivationRequest:
+    """One staged component participating in a multi-component switch."""
+
+    component: str
+    release_id: str
+    staged: Path
+    health_check: Callable[[Path], object]
+    prepare_and_health: Callable[[Path], object] | None = None
+    metadata: dict[str, Any] | None = None
+    replace_existing: bool = False
 
 
 class HealthCheckRunner:
@@ -131,6 +153,123 @@ class ActivationManager:
         path = self.release_path(component, record["active"])
         return path if path.is_dir() else None
 
+    def snapshot_state(self) -> ActivationSnapshot:
+        """Capture state so a wider install transaction can restore it."""
+
+        return ActivationSnapshot(self.state_path.is_file(), deepcopy(self._read_state()))
+
+    def restore_state(self, snapshot: ActivationSnapshot) -> None:
+        """Restore a previously captured state using the same atomic writer."""
+
+        if not isinstance(snapshot, ActivationSnapshot):
+            raise ActivationError("activation snapshot has an invalid type")
+        state = deepcopy(snapshot.state)
+        if state.get("schema_version") != self.STATE_SCHEMA or not isinstance(state.get("components"), dict):
+            raise ActivationError("activation snapshot schema is invalid")
+        if snapshot.state_file_existed:
+            self._write_state(state)
+            return
+        try:
+            self.state_path.unlink(missing_ok=True)
+        except OSError as error:
+            raise ActivationError(f"could not restore empty activation state: {error}") from error
+
+    def activate_many(
+        self,
+        requests: list[ActivationRequest],
+        *,
+        final_health_check: Callable[[dict[str, Path]], object] | None = None,
+    ) -> dict[str, Path]:
+        """Place and health-check components, then publish one state update.
+
+        Directories may need to be moved to their final paths before conda's
+        relocation check can run.  Until every component and the combined
+        desktop smoke test pass, the authoritative state file is untouched.
+        Any failure restores same-version repairs from quarantine.
+        """
+
+        if not requests:
+            paths: dict[str, Path] = {}
+            if final_health_check is not None:
+                final_health_check(paths)
+            return paths
+        components = [self._validate_id(item.component, "component") for item in requests]
+        if len(set(components)) != len(components):
+            raise ActivationError("activation transaction contains duplicate components")
+        snapshot = self.snapshot_state()
+        placements: list[tuple[ActivationRequest, Path, Path | None, bool]] = []
+        result: dict[str, Path] = {}
+        try:
+            for request in requests:
+                component = self._validate_id(request.component, "component")
+                release_id = self._validate_id(request.release_id, "release_id")
+                staged = request.staged.resolve(strict=True)
+                try:
+                    staged.relative_to(self.staging_root)
+                except ValueError as error:
+                    raise ActivationError("staged directory is outside the managed staging root") from error
+                target = self.release_path(component, release_id)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                quarantine: Path | None = None
+                created_target = False
+                staged_check = request.prepare_and_health or request.health_check
+                if target.exists() and not request.replace_existing:
+                    request.health_check(target)
+                    shutil.rmtree(staged)
+                else:
+                    if target.exists():
+                        quarantine_root = target.parent.parent / "quarantine"
+                        quarantine_root.mkdir(parents=True, exist_ok=True)
+                        quarantine = quarantine_root / f"{release_id}-{uuid.uuid4().hex}"
+                        os.replace(target, quarantine)
+                    try:
+                        os.replace(staged, target)
+                        created_target = True
+                        staged_check(target)
+                    except Exception:
+                        if target.exists():
+                            shutil.rmtree(target)
+                        if quarantine is not None and quarantine.exists():
+                            os.replace(quarantine, target)
+                        raise
+                placements.append((request, target, quarantine, created_target))
+                result[component] = target
+
+            if final_health_check is not None:
+                final_health_check(result)
+
+            state = deepcopy(snapshot.state)
+            for request, _target, _quarantine, _created in placements:
+                old = state["components"].get(request.component, {})
+                old_active = old.get("active") if isinstance(old, dict) else None
+                state["components"][request.component] = {
+                    "active": request.release_id,
+                    "previous": old_active if old_active != request.release_id else old.get("previous"),
+                    "activated_at": _utc_now(),
+                    "metadata": request.metadata or {},
+                }
+            self._write_state(state)
+        except Exception as error:
+            for request, target, quarantine, created_target in reversed(placements):
+                try:
+                    if created_target and target.exists():
+                        shutil.rmtree(target)
+                    if quarantine is not None and quarantine.exists():
+                        os.replace(quarantine, target)
+                except OSError as rollback_error:
+                    raise ActivationError(
+                        f"activation failed ({error}) and filesystem rollback failed: {rollback_error}"
+                    ) from rollback_error
+            self.restore_state(snapshot)
+            if isinstance(error, (ActivationError, HealthCheckError)):
+                raise
+            raise ActivationError(f"multi-component activation failed: {error}") from error
+
+        for _request, _target, quarantine, _created in placements:
+            if quarantine is not None and quarantine.exists():
+                shutil.rmtree(quarantine, ignore_errors=True)
+        return result
+
     def activate(
         self,
         component: str,
@@ -142,56 +281,16 @@ class ActivationManager:
         metadata: dict[str, Any] | None = None,
         replace_existing: bool = False,
     ) -> Path:
-        component = self._validate_id(component, "component")
-        release_id = self._validate_id(release_id, "release_id")
-        staged = staged.resolve(strict=True)
-        try:
-            staged.relative_to(self.staging_root)
-        except ValueError as error:
-            raise ActivationError("staged directory is outside the managed staging root") from error
-        staged_check = prepare_and_health or health_check
-        target = self.release_path(component, release_id)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() and not replace_existing:
-            health_check(target)
-            shutil.rmtree(staged)
-        elif target.exists():
-            quarantine_root = target.parent.parent / "quarantine"
-            quarantine_root.mkdir(parents=True, exist_ok=True)
-            quarantine = quarantine_root / f"{release_id}-{uuid.uuid4().hex}"
-            try:
-                os.replace(target, quarantine)
-                os.replace(staged, target)
-                staged_check(target)
-            except Exception as error:
-                if target.exists() and not staged.exists():
-                    os.replace(target, staged)
-                if not target.exists() and quarantine.exists():
-                    os.replace(quarantine, target)
-                if isinstance(error, (ActivationError, HealthCheckError)):
-                    raise
-                raise ActivationError(f"could not replace the staged release safely: {error}") from error
-        else:
-            try:
-                os.replace(staged, target)
-                staged_check(target)
-            except Exception as error:
-                if target.exists() and not staged.exists():
-                    os.replace(target, staged)
-                if isinstance(error, (ActivationError, HealthCheckError)):
-                    raise
-                raise ActivationError(f"could not atomically place staged release: {error}") from error
-        state = self._read_state()
-        old = state["components"].get(component, {})
-        old_active = old.get("active") if isinstance(old, dict) else None
-        state["components"][component] = {
-            "active": release_id,
-            "previous": old_active if old_active != release_id else old.get("previous"),
-            "activated_at": _utc_now(),
-            "metadata": metadata or {},
-        }
-        self._write_state(state)
-        return target
+        request = ActivationRequest(
+            component,
+            release_id,
+            staged,
+            health_check,
+            prepare_and_health,
+            metadata,
+            replace_existing,
+        )
+        return self.activate_many([request])[component]
 
     def rollback(self, component: str, *, health_check: Callable[[Path], object]) -> Path:
         component = self._validate_id(component, "component")

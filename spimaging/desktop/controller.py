@@ -9,10 +9,11 @@ import sys
 
 from spimaging.appcore.config import RunConfig
 from spimaging.appcore.events import WorkerEvent
+from spimaging.appcore.history import HistoryStore
 from spimaging.appcore.process import CancellationToken, WindowsJob
-from spimaging.appcore.storage import RunLayout, atomic_write_text
+from spimaging.appcore.storage import RunLayout, atomic_write_text, finalize_stale_run
 from spimaging.desktop.dependency import require_pyside6
-from spimaging.desktop.models import RunProgressState, TERMINAL_STATUSES
+from spimaging.desktop.models import ApplicationPaths, RunProgressState, TERMINAL_STATUSES
 
 
 require_pyside6()
@@ -21,11 +22,19 @@ from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signa
 
 
 def normalize_worker_python(executable: str | Path) -> str:
-    """Use console ``python.exe`` when the GUI itself runs under ``pythonw.exe``."""
+    """Prefer the windowed interpreter on Windows while retaining pipe I/O.
+
+    ``QProcess`` supplies explicit stdin/stdout handles, so ``pythonw.exe`` can
+    still carry the JSONL protocol without allocating a visible console.  The
+    console interpreter remains the portable fallback for source environments
+    that do not ship its windowed sibling.
+    """
 
     candidate = Path(executable).expanduser()
-    if candidate.name.lower() == "pythonw.exe":
-        return str(candidate.with_name("python.exe"))
+    if os.name == "nt" and candidate.name.lower() == "python.exe":
+        windowed = candidate.with_name("pythonw.exe")
+        if windowed.is_file():
+            return str(windowed)
     return str(candidate)
 
 
@@ -200,12 +209,29 @@ class WorkerController(QObject):
             if status not in TERMINAL_STATUSES:
                 if self._cancel_requested:
                     status = "cancelled"
-                elif exit_code != 0:
-                    status = "interrupted"
                 else:
-                    status = "succeeded"
+                    # A zero exit code without the worker's terminal event and
+                    # manifest is not sufficient evidence of success.
+                    status = "interrupted"
+                if self._config is not None:
+                    try:
+                        status = finalize_stale_run(
+                            self._config.output.run_dir,
+                            status,
+                            expected_run_id=self._config.run_id,
+                        )
+                    except (OSError, ValueError) as exc:
+                        self.protocol_warning.emit(f"无法写入任务终态：{exc}")
                 self._progress.status = status
                 self.progress_changed.emit(self._progress)
+        if self._config is not None and status in TERMINAL_STATUSES:
+            try:
+                history_path = self._config.output.history_db or str(
+                    ApplicationPaths.default().history_db
+                )
+                HistoryStore(history_path).upsert(self._config, status)
+            except (OSError, ValueError) as exc:
+                self.protocol_warning.emit(f"无法更新任务历史：{exc}")
         self.state_changed.emit(status)
         if not self._finished_emitted:
             self._finished_emitted = True
