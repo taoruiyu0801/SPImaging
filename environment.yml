@@ -12,6 +12,7 @@ dependencies:
   - imageio
   - scikit-image
   - matplotlib
+  - pyside6>=6.8,<7
   - tk
   - tqdm
   - pytest

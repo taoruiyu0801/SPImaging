@@ -28,7 +28,7 @@ PUBLIC_MODULES = (
 def test_package_import() -> None:
     import spimaging
 
-    assert spimaging.__version__ == "0.1.0"
+    assert spimaging.__version__ == "0.2.0-beta.1"
     assert Path(spimaging.__file__).resolve().is_relative_to(REPOSITORY_ROOT)
 
 
