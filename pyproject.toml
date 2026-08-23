@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spimaging"
-version = "0.1.0"
+version = "0.2.0b1"
 description = "Generate SPAD-style single-photon imaging measurements from RGB-D datasets."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -22,6 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 single-surface = ["torch", "deepinv"]
 training = ["torch", "deepinv"]
+desktop = ["PySide6>=6.8,<7"]
 
 [project.scripts]
 spad-generate = "spimaging.generation.pipeline:main"
@@ -32,6 +33,8 @@ spad-evaluate = "spimaging.testing.evaluate:main"
 spad-verify = "spimaging.testing.verify:main"
 spad-browse = "spimaging.testing.browse:main"
 spad-demo = "spimaging.demo:main"
+spimaging-desktop = "spimaging.desktop.__main__:main"
+spimaging-worker = "spimaging.worker:main"
 spad-browse-4modes = "spimaging.testing.browse:main"
 
 [tool.setuptools.packages.find]
