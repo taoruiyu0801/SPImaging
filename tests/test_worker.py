@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -14,12 +15,92 @@ from spimaging.appcore.config import RunConfig
 from spimaging.appcore.events import EventType
 from spimaging.appcore.storage import ResultManifest
 from spimaging.worker import WorkerRuntime, build_parser
+from spimaging.worker import _completed_generation_is_valid
+from spimaging.generation.recovery import partial_directory_for
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 class WorkerRuntimeTests(unittest.TestCase):
+    def test_generation_adapter_uses_resume_only_for_an_existing_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = RunConfig.new(
+                "generate",
+                root / "run",
+                input={"source_path": str(root / "source")},
+                generation={
+                    "enabled": True,
+                    "dataset_mode": "middlebury",
+                    "surface_model": "neighborhood_mix",
+                    "resume": True,
+                },
+                output={"history_db": str(root / "history.sqlite3")},
+            )
+            runtime = WorkerRuntime(config, stream=io.StringIO())
+            output_dir = runtime.layout.artifacts / "dataset"
+
+            fresh = runtime._generation_command(output_dir)
+            self.assertNotIn("--resume", fresh)
+            self.assertNotIn("--overwrite", fresh)
+
+            partial_directory_for(output_dir).mkdir(parents=True)
+            resumed = runtime._generation_command(output_dir)
+            self.assertIn("--resume", resumed)
+            self.assertNotIn("--overwrite", resumed)
+
+    def test_generation_adapter_replaces_owned_state_only_when_resume_is_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = RunConfig.new(
+                "generate",
+                root / "run",
+                input={"source_path": str(root / "source")},
+                generation={
+                    "enabled": True,
+                    "dataset_mode": "middlebury",
+                    "surface_model": "neighborhood_mix",
+                    "resume": False,
+                },
+                output={"history_db": str(root / "history.sqlite3")},
+            )
+            runtime = WorkerRuntime(config, stream=io.StringIO())
+            output_dir = runtime.layout.artifacts / "dataset"
+            partial_directory_for(output_dir).mkdir(parents=True)
+
+            command = runtime._generation_command(output_dir)
+
+            self.assertIn("--overwrite", command)
+            self.assertNotIn("--resume", command)
+
+    def test_completed_generation_is_reused_only_after_integrity_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory) / "dataset"
+            output_dir.mkdir()
+            sample = output_dir / "sample_00000.npz"
+            sample.write_bytes(b"synthetic sample")
+            digest = hashlib.sha256(sample.read_bytes()).hexdigest()
+            (output_dir / "generation_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "complete",
+                        "completed": [
+                            {
+                                "file": sample.name,
+                                "bytes": sample.stat().st_size,
+                                "sha256": digest,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertTrue(_completed_generation_is_valid(output_dir))
+            sample.write_bytes(b"tampered")
+            self.assertFalse(_completed_generation_is_valid(output_dir))
+
     def test_noop_workflow_writes_complete_run_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

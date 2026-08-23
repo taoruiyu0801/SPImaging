@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ from spimaging.appcore.specs import (
     SIMULATION_ALGORITHMS,
 )
 from spimaging.appcore.storage import ResultManifest, RunStorage
+from spimaging.generation.recovery import partial_directory_for
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -107,6 +109,46 @@ def _history_path(config: RunConfig) -> Path:
     local = os.environ.get("LOCALAPPDATA")
     root = Path(local) if local else Path.home() / ".spimaging"
     return root / "SPImaging" / "history.sqlite3"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _completed_generation_is_valid(output_dir: Path) -> bool:
+    """Only reuse a published generation whose recorded samples still match."""
+
+    manifest_path = output_dir / "generation_manifest.json"
+    try:
+        if manifest_path.stat().st_size > 8 * 1024 * 1024:
+            return False
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(manifest, Mapping):
+        return False
+    completed = manifest.get("completed")
+    if manifest.get("schema_version") != 1 or manifest.get("status") != "complete":
+        return False
+    if not isinstance(completed, list) or not completed:
+        return False
+    for item in completed:
+        if not isinstance(item, Mapping):
+            return False
+        name = item.get("file")
+        if not isinstance(name, str) or Path(name).name != name:
+            return False
+        sample = output_dir / name
+        try:
+            if sample.stat().st_size != item.get("bytes") or _sha256(sample) != item.get("sha256"):
+                return False
+        except OSError:
+            return False
+    return True
 
 
 class WorkerRuntime:
@@ -286,7 +328,10 @@ class WorkerRuntime:
             values,
             (*GENERATION_COMMON_PARAMETERS, *algorithm.parameters),
         )
-        if config.resume:
+        partial_exists = partial_directory_for(output_dir).is_dir()
+        if config.resume and partial_exists:
+            arguments.append("--resume")
+        elif not config.resume and (partial_exists or output_dir.exists()):
             arguments.append("--overwrite")
         return _module_command("spimaging.generation.pipeline", arguments)
 
@@ -468,7 +513,18 @@ class WorkerRuntime:
                 dataset: Path | None = None
                 if self.config.workflow == "generate" or self.config.generation.enabled:
                     dataset = self.layout.artifacts / "dataset"
-                    self.run_command("generate", self._generation_command(dataset))
+                    partial_exists = partial_directory_for(dataset).is_dir()
+                    if (
+                        self.config.generation.resume
+                        and not partial_exists
+                        and _completed_generation_is_valid(dataset)
+                    ):
+                        self.events.emit(
+                            EventType.WARNING,
+                            {"stage": "generate", "message": "已校验并复用完整的生成数据。"},
+                        )
+                    else:
+                        self.run_command("generate", self._generation_command(dataset))
                 if dataset is None:
                     dataset = self._resolve_dataset()
 
