@@ -13,6 +13,12 @@ import unittest
 import zipfile
 
 from launcher.activation import ActivationManager
+from launcher.app import (
+    _updates_disabled,
+    build_parser as build_launcher_parser,
+    load_desktop_preferences,
+    runtime_preference,
+)
 from launcher.archive import safe_extract_zip
 from launcher.bootstrap import Provisioner
 from launcher.download import DownloadResponse, download_asset, download_part, sha256_file
@@ -370,6 +376,37 @@ class ProvisioningTests(unittest.TestCase):
 
 
 class UpdateStateTests(unittest.TestCase):
+    def test_desktop_settings_control_runtime_cache_and_update_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            install_root = Path(temporary)
+            cache_dir = install_root / "custom cache"
+            (install_root / "settings.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "device": "cpu",
+                        "cache_dir": str(cache_dir),
+                        "update_checks": False,
+                        "ignored": "value",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = build_launcher_parser().parse_args(
+                ["--install-root", str(install_root), "--headless"]
+            )
+            preferences = load_desktop_preferences(install_root)
+            self.assertEqual(preferences["cache_dir"], str(cache_dir))
+            self.assertEqual(runtime_preference(args), "cpu")
+            self.assertTrue(_updates_disabled(args))
+
+            explicit = build_launcher_parser().parse_args(
+                ["--install-root", str(install_root), "--runtime", "cuda", "--headless"]
+            )
+            self.assertEqual(runtime_preference(explicit), "cuda")
+            explicit.check_now = True
+            self.assertFalse(_updates_disabled(explicit))
+
     def test_manifest_update_rejects_plain_http_before_transport(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             cache = ManifestCache(Path(temporary))

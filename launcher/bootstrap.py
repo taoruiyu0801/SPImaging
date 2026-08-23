@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 import subprocess
+import sys
 from typing import Callable
 
 from .activation import ActivationManager, HealthCheckRunner
@@ -42,12 +43,18 @@ class Provisioner:
         install_root: Path,
         transport: DownloadTransport,
         *,
+        cache_root: Path | None = None,
         verifier: SignatureVerifier | None = None,
         health_runner: HealthCheckRunner | None = None,
         progress: ProgressCallback | None = None,
     ) -> None:
         self.manager = ActivationManager(install_root)
-        self.cache_root = self.manager.install_root / "cache"
+        self.cache_root = (
+            Path(cache_root).expanduser().resolve()
+            if cache_root is not None
+            else self.manager.install_root / "cache"
+        )
+        self.cache_root.mkdir(parents=True, exist_ok=True)
         self.transport = transport
         self.verifier = verifier
         self.health_runner = health_runner or HealthCheckRunner()
@@ -160,6 +167,8 @@ def build_desktop_command(manifest: ReleaseManifest, result: ProvisionResult) ->
 
 def launch_desktop(manifest: ReleaseManifest, result: ProvisionResult) -> subprocess.Popen[bytes]:
     command, environment = build_desktop_command(manifest, result)
+    if getattr(sys, "frozen", False):
+        environment["SPIMAGING_LAUNCHER_EXE"] = str(Path(sys.executable).resolve())
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     return subprocess.Popen(
         command,

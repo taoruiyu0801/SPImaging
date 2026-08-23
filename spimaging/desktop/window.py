@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
 
 from spimaging.appcore.config import RunConfig
 from spimaging.desktop.controller import WorkerController
@@ -33,6 +35,7 @@ require_pyside6()
 from PySide6.QtCore import QTimer, Qt  # noqa: E402
 from PySide6.QtGui import QCloseEvent  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
+    QApplication,
     QButtonGroup,
     QFrame,
     QHBoxLayout,
@@ -285,14 +288,55 @@ class MainWindow(QMainWindow):
         self.history_page.runs_root = Path(settings.runs_dir)
 
     def _repair_environment(self) -> None:
-        QMessageBox.information(
+        launcher_value = os.environ.get("SPIMAGING_LAUNCHER_EXE", "").strip()
+        launcher = Path(launcher_value).expanduser().resolve() if launcher_value else None
+        if launcher is None or not launcher.is_file():
+            QMessageBox.information(
+                self,
+                tr("MainWindow", "运行环境修复"),
+                tr(
+                    "MainWindow",
+                    "源代码模式没有私有启动器；请在当前 Conda 环境中修复依赖。安装版会在这里重新校验并原子切换运行时。",
+                ),
+            )
+            return
+        if self.worker.is_running:
+            QMessageBox.warning(
+                self,
+                tr("MainWindow", "任务正在运行"),
+                tr("MainWindow", "请先等待任务结束或安全取消，再修复运行环境。"),
+            )
+            return
+        answer = QMessageBox.question(
             self,
-            tr("MainWindow", "运行环境修复"),
-            tr(
-                "MainWindow",
-                "安装版会将修复请求交给 SPImaging 启动器，重新校验并原子切换私有运行时。源代码模式下请使用当前 Conda 环境修复依赖。",
-            ),
+            tr("MainWindow", "修复私有运行环境"),
+            tr("MainWindow", "软件将关闭，并由启动器重新下载或校验所选运行时。是否继续？"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        command = [
+            str(launcher),
+            "--repair",
+            "--runtime",
+            self.settings.device,
+            "--wait-for-pid",
+            str(os.getpid()),
+        ]
+        try:
+            subprocess.Popen(
+                command,
+                cwd=launcher.parent,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as exc:
+            QMessageBox.critical(self, tr("MainWindow", "无法启动修复"), str(exc))
+            return
+        QApplication.quit()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if not self.worker.is_running:

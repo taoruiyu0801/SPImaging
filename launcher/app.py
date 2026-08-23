@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import os
 import queue
 import sys
 import threading
+import time
 from typing import Callable, Sequence
 
 from .activation import ActivationManager
@@ -40,13 +43,19 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--manifest-url", default=DEFAULT_MANIFEST_URL)
     source.add_argument("--manifest-file", type=Path, help="validated local manifest for packaging tests")
     parser.add_argument("--install-root", type=Path, default=default_install_root())
-    parser.add_argument("--runtime", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument(
+        "--runtime",
+        choices=("auto", "cuda", "cpu"),
+        default=None,
+        help="运行时偏好；省略时读取桌面设置，默认 auto。",
+    )
     parser.add_argument("--headless", action="store_true", help="do not create the bootstrap window")
     parser.add_argument("--dry-run", action="store_true", help="validate/select only; do not download or launch")
     parser.add_argument("--no-launch", action="store_true", help="provision but do not start the desktop")
     parser.add_argument("--repair", action="store_true", help="recheck and reinstall the selected release")
     parser.add_argument("--check-now", action="store_true", help="ignore the 24-hour update-check interval")
     parser.add_argument("--accept-update", action="store_true", help="allow update without an interactive confirmation")
+    parser.add_argument("--wait-for-pid", type=int, default=None, help=argparse.SUPPRESS)
     return parser
 
 
@@ -55,6 +64,61 @@ class ResolvedManifest:
     manifest: ReleaseManifest
     raw: bytes
     message: str
+
+
+def load_desktop_preferences(install_root: Path) -> dict[str, object]:
+    """Read the small desktop settings file without trusting arbitrary fields."""
+
+    path = install_root.expanduser().resolve() / "settings.json"
+    try:
+        if path.stat().st_size > 1024 * 1024:
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, object] = {}
+    if raw.get("device") in {"auto", "cuda", "cpu"}:
+        result["device"] = raw["device"]
+    if isinstance(raw.get("cache_dir"), str) and raw["cache_dir"].strip():
+        result["cache_dir"] = raw["cache_dir"]
+    if isinstance(raw.get("update_checks"), bool):
+        result["update_checks"] = raw["update_checks"]
+    return result
+
+
+def runtime_preference(args: argparse.Namespace) -> str:
+    if args.runtime is not None:
+        return str(args.runtime)
+    return str(load_desktop_preferences(args.install_root).get("device", "auto"))
+
+
+def _updates_disabled(args: argparse.Namespace) -> bool:
+    if args.manifest_file is not None or args.check_now or args.repair:
+        return False
+    return load_desktop_preferences(args.install_root).get("update_checks") is False
+
+
+def _wait_for_pid(pid: int | None, timeout_seconds: int = 300) -> None:
+    if pid is None or pid <= 0 or pid == os.getpid():
+        return
+    if os.name == "nt":
+        synchronize = 0x00100000
+        handle = ctypes.windll.kernel32.OpenProcess(synchronize, False, int(pid))
+        if handle:
+            try:
+                ctypes.windll.kernel32.WaitForSingleObject(handle, timeout_seconds * 1000)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+            return
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        time.sleep(0.1)
 
 
 def resolve_manifest(args: argparse.Namespace, transport: UrllibTransport) -> ResolvedManifest:
@@ -98,13 +162,21 @@ def run_install(
     transport: UrllibTransport,
     progress: Callable[[str, int, int], None] | None = None,
 ) -> ProvisionResult:
+    preferences = load_desktop_preferences(args.install_root)
+    cache_value = preferences.get("cache_dir")
     provisioner = Provisioner(
         args.install_root,
         transport,
+        cache_root=Path(cache_value) if isinstance(cache_value, str) else None,
         verifier=WindowsSignatureVerifier(),
         progress=progress,
     )
-    result = provisioner.provision(resolved.manifest, args.runtime, capability, force=args.repair)
+    result = provisioner.provision(
+        resolved.manifest,
+        runtime_preference(args),
+        capability,
+        force=args.repair,
+    )
     ManifestCache(args.install_root).mark_active(resolved.raw, resolved.manifest)
     return result
 
@@ -123,6 +195,11 @@ def _launch_existing(args: argparse.Namespace) -> int:
 
 
 def _run_headless(args: argparse.Namespace) -> int:
+    if _updates_disabled(args):
+        try:
+            return _launch_existing(args)
+        except LauncherError:
+            pass
     transport = UrllibTransport()
     try:
         resolved = resolve_manifest(args, transport)
@@ -131,7 +208,7 @@ def _run_headless(args: argparse.Namespace) -> int:
             return _launch_existing(args)
         raise
     capability = probe_nvidia()
-    selection = select_runtime_asset(resolved.manifest, args.runtime, capability)
+    selection = select_runtime_asset(resolved.manifest, runtime_preference(args), capability)
     if args.dry_run:
         print(f"manifest={resolved.manifest.release_version}")
         print(f"runtime={selection.selected_variant}")
@@ -178,6 +255,14 @@ def _run_gui(args: argparse.Namespace) -> int:
     def work() -> None:
         transport = UrllibTransport()
         try:
+            if _updates_disabled(args):
+                cache = ManifestCache(args.install_root)
+                active_manifest = cache.load_active()
+                installed = _installed_result(args.install_root, active_manifest) if active_manifest else None
+                if active_manifest is not None and installed is not None:
+                    events.put(("status", "已按设置关闭自动更新检查，使用本地版本"))
+                    events.put(("done", (active_manifest, installed)))
+                    return
             try:
                 resolved = resolve_manifest(args, transport)
             except LauncherError as fetch_error:
@@ -263,6 +348,7 @@ def _run_gui(args: argparse.Namespace) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    _wait_for_pid(args.wait_for_pid)
     try:
         return _run_headless(args) if args.headless or args.dry_run else _run_gui(args)
     except LauncherError as error:
