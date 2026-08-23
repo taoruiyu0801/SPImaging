@@ -10,4 +10,5 @@ Schema/config roundtrip, algorithm registry, event writer, history and fake work
 - All tests pass without PySide6 or network.
 
 ## Actual Result
-- Not run yet.
+- Passed on 2026-08-23: `14 passed in 0.70s`.
+- Covered schema roundtrip/rejection, algorithm visibility/defaults, event sequencing, atomic manifests, safe paths, history interruption/rebuild, diagnostics redaction and worker module execution.
