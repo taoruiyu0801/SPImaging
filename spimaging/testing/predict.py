@@ -10,6 +10,7 @@ import zipfile
 from spimaging.cli import (
     ArgumentParser,
     HelpFormatter,
+    add_device_arguments,
     create_output_parent,
     require_file,
     validate_npz_archive,
@@ -50,6 +51,7 @@ def build_parser():
         action="store_true",
         help="Allow existing output files to be replaced.",
     )
+    add_device_arguments(parser)
     return parser
 
 
@@ -58,30 +60,33 @@ def parse_args(argv=None):
 
 
 def load_model(checkpoint, device):
-    import torch
-
     from spimaging.training_common.networks import build_model, build_self_supervised_model, canonical_model_name
+    from spimaging.training_common.security import load_checkpoint_safely
 
-    ckpt = torch.load(checkpoint, map_location=device)
-    if not isinstance(ckpt, Mapping):
-        raise ValueError("checkpoint root must be a mapping")
+    ckpt = load_checkpoint_safely(checkpoint, map_location=device)
     train_args = ckpt.get("args", {})
-    if not isinstance(train_args, Mapping):
-        raise ValueError("checkpoint field 'args' must be a mapping")
-    if "model_state" not in ckpt or not isinstance(ckpt["model_state"], Mapping):
-        raise ValueError("checkpoint field 'model_state' is missing or invalid")
     method_family = ckpt.get("method_family", "supervised")
+    if method_family not in {"supervised", "self_supervised_spisr"}:
+        raise ValueError(f"unsupported checkpoint method_family: {method_family!r}")
     model_name = canonical_model_name(ckpt.get("model_name", train_args.get("model", "simple3d")))
     base_channels = int(train_args.get("base_channels", 8))
     num_blocks = int(train_args.get("num_blocks", 10))
+    if not 1 <= base_channels <= 256:
+        raise ValueError("checkpoint base_channels must be between 1 and 256")
+    if not 1 <= num_blocks <= 100:
+        raise ValueError("checkpoint num_blocks must be between 1 and 100")
     if method_family == "self_supervised_spisr":
+        time_scale = int(train_args.get("time_scale", 2))
+        spatial_scale = int(train_args.get("spatial_scale", 2))
+        if not 1 <= time_scale <= 64 or not 1 <= spatial_scale <= 64:
+            raise ValueError("checkpoint time/spatial scales must be between 1 and 64")
         model = build_self_supervised_model(
             model_name,
             in_channels=1,
             base_channels=base_channels,
             num_blocks=num_blocks,
-            time_scale=int(train_args.get("time_scale", 2)),
-            spatial_scale=int(train_args.get("spatial_scale", 2)),
+            time_scale=time_scale,
+            spatial_scale=spatial_scale,
         ).to(device)
     else:
         model = build_model(
@@ -158,8 +163,14 @@ def main():
 
     from spimaging.training_common.dataset import SPADHistogramDataset, SPISRSelfSupervisedDataset
     from spimaging.training_common.device import get_torch_device
+    from spimaging.training_common.security import UnsafeArchiveError, load_spad_sample
 
-    device = get_torch_device()
+    selection = get_torch_device(
+        mode=args.device,
+        gpu_index=args.gpu_index,
+        return_selection=True,
+    )
+    device = selection.device
     try:
         model, train_args, method_family = load_model(checkpoint, device)
     except (EOFError, IndexError, KeyError, OSError, RuntimeError, ValueError, pickle.UnpicklingError) as exc:
@@ -180,6 +191,7 @@ def main():
             target_sigma_bins=float(train_args.get("target_sigma_bins", 2.0)),
             target_source=str(train_args.get("target_source", "depth")),
             use_log_counts=not bool(train_args.get("no_log_counts", False)),
+            require_depth=False,
         )
     try:
         item = dataset[0]
@@ -200,8 +212,8 @@ def main():
 
     pred_depth_m = pred_depth_m.squeeze(0).cpu().numpy().astype(np.float32)
     try:
-        raw = np.load(sample_file, allow_pickle=True)
-    except (EOFError, OSError, ValueError, zipfile.BadZipFile) as exc:
+        raw = load_spad_sample(sample_file, required_keys=("counts",))
+    except UnsafeArchiveError as exc:
         parser.error(f"cannot read --sample_file {sample_file}: {exc}")
     target_depth_m = raw["depth_m"].astype(np.float32) if "depth_m" in raw else None
 
@@ -221,6 +233,9 @@ def main():
         save_dict["target_depth_m"] = target_depth_m
         save_dict["abs_error_m"] = np.abs(pred_depth_m - target_depth_m)
     np.savez_compressed(output_npz, **save_dict)
+    print(f"Device: {device}")
+    if selection.fallback:
+        print(f"Device selection: {selection.reason}")
     print(f"Saved prediction to: {output_npz}")
 
     if output_fig is not None:

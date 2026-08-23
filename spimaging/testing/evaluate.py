@@ -15,6 +15,7 @@ import numpy as np
 from spimaging.cli import (
     ArgumentParser,
     HelpFormatter,
+    add_device_arguments,
     create_output_directory,
     nonnegative_int,
     require_directory,
@@ -64,6 +65,7 @@ def build_parser():
         action="store_true",
         help="Allow writing into an existing non-empty output directory.",
     )
+    add_device_arguments(parser)
     return parser
 
 
@@ -96,6 +98,7 @@ def predict_one(checkpoint, sample, device):
 
     from spimaging.testing.predict import expected_depth_from_logits, load_model, match_input_time_bins
     from spimaging.training_common.dataset import SPADHistogramDataset, SPISRSelfSupervisedDataset
+    from spimaging.training_common.security import load_spad_sample
 
     model, train_args, method_family = load_model(checkpoint, device)
     temporal_downsample = int(train_args.get("temporal_downsample", 1))
@@ -130,7 +133,7 @@ def predict_one(checkpoint, sample, device):
         pred = expected_depth_from_logits(logits, bin_size, effective_downsample)
 
     pred = pred.squeeze(0).cpu().numpy().astype(np.float32)
-    raw = np.load(sample, allow_pickle=True)
+    raw = load_spad_sample(sample, required_keys=("counts", "depth_m"))
     target = raw["depth_m"].astype(np.float32)
     if pred.shape != target.shape:
         target_tensor = torch.from_numpy(target[None, None, ...]).float()
@@ -220,7 +223,12 @@ def main():
     from spimaging.testing.predict import load_model
     from spimaging.training_common.device import get_torch_device
 
-    device = get_torch_device()
+    selection = get_torch_device(
+        mode=args.device,
+        gpu_index=args.gpu_index,
+        return_selection=True,
+    )
+    device = selection.device
     for checkpoint in checkpoints:
         try:
             model, _, _ = load_model(checkpoint, device)
@@ -285,6 +293,8 @@ def main():
         save_comparison_figure(output_dir / "comparison.png", figure_sample, figure_target, figure_predictions)
 
     print(f"Device: {device}")
+    if selection.fallback:
+        print(f"Device selection: {selection.reason}")
     print(json.dumps(summary, indent=2))
     print(f"Saved metrics and figure to: {output_dir}")
 

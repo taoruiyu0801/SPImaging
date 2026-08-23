@@ -110,7 +110,7 @@ def test_simple3d_training_matrix(
     for checkpoint_name in ("last.pt", "best.pt"):
         checkpoint_path = output_dir / checkpoint_name
         assert checkpoint_path.is_file()
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         assert checkpoint["epoch"] == 1
         assert checkpoint["model_name"] == "simple3d"
         assert checkpoint["method_family"] == "supervised"

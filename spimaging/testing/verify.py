@@ -114,7 +114,7 @@ def summarize_sample(data, sample_path: Path):
     print(f"Full path   : {sample_path}")
     print("=" * 80)
 
-    for key in data.files:
+    for key in data:
         arr = data[key]
         if isinstance(arr, np.ndarray):
             print(f"{key:>24s} | shape={arr.shape}, dtype={arr.dtype}")
@@ -212,7 +212,9 @@ def main():
         )
 
     try:
-        data = np.load(sample_path, allow_pickle=True)
+        from spimaging.training_common.security import load_spad_sample
+
+        data = load_spad_sample(sample_path)
         summarize_sample(data, sample_path)
 
         rgb = data["rgb"] if "rgb" in data else None

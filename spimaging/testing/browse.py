@@ -576,8 +576,9 @@ class SPADBrowser:
     def load_current(self):
         path = self.files[self.index]
         try:
-            with np.load(path, allow_pickle=True) as archive:
-                data = {key: archive[key] for key in archive.files}
+            from spimaging.training_common.security import load_spad_sample
+
+            data = load_spad_sample(path)
         except (
             EOFError,
             OSError,

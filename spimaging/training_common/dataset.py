@@ -110,12 +110,14 @@ class SPADHistogramDataset(Dataset):
         target_sigma_bins=2.0,
         target_source="depth",
         use_log_counts=True,
+        require_depth=True,
     ):
         self.files = [Path(p) for p in files]
         self.temporal_downsample = int(temporal_downsample)
         self.target_sigma_bins = float(target_sigma_bins)
         self.target_source = str(target_source)
         self.use_log_counts = bool(use_log_counts)
+        self.require_depth = bool(require_depth)
 
         if self.target_source not in {"depth", "clean"}:
             raise ValueError("target_source must be 'depth' or 'clean'.")
@@ -129,13 +131,25 @@ class SPADHistogramDataset(Dataset):
 
     def __getitem__(self, index):
         path = self.files[index]
-        data = np.load(path, allow_pickle=True)
+        from spimaging.training_common.security import load_spad_sample
+
+        required_keys = ("counts", "depth_m") if self.require_depth else ("counts",)
+        data = load_spad_sample(path, required_keys=required_keys)
 
         counts = downsample_time(data["counts"], self.temporal_downsample)
         counts_input = normalize_counts(counts, use_log=self.use_log_counts)[None, ...]
 
-        depth_m = data["depth_m"].astype(np.float32)
         bin_size = float(data["bin_size"]) if "bin_size" in data else 80e-12
+
+        result = {
+            "input": torch.from_numpy(counts_input),
+            "bin_size": torch.tensor(bin_size, dtype=torch.float32),
+            "path": str(path),
+        }
+        if "depth_m" not in data:
+            return result
+
+        depth_m = data["depth_m"].astype(np.float32)
 
         if self.target_source == "clean" and "transient_clean" in data:
             transient = downsample_time(data["transient_clean"], self.temporal_downsample)
@@ -149,13 +163,13 @@ class SPADHistogramDataset(Dataset):
                 sigma_bins=self.target_sigma_bins,
             )
 
-        return {
-            "input": torch.from_numpy(counts_input),
-            "target": torch.from_numpy(target),
-            "depth_m": torch.from_numpy(depth_m[None, ...]),
-            "bin_size": torch.tensor(bin_size, dtype=torch.float32),
-            "path": str(path),
-        }
+        result.update(
+            {
+                "target": torch.from_numpy(target),
+                "depth_m": torch.from_numpy(depth_m[None, ...]),
+            }
+        )
+        return result
 
 
 class SPISRSelfSupervisedDataset(Dataset):
@@ -189,7 +203,9 @@ class SPISRSelfSupervisedDataset(Dataset):
 
     def __getitem__(self, index):
         path = self.files[index]
-        data = np.load(path, allow_pickle=True)
+        from spimaging.training_common.security import load_spad_sample
+
+        data = load_spad_sample(path, required_keys=("counts",))
         counts = downsample_time(data["counts"], self.temporal_downsample)
         counts = downsample_space(counts, self.spatial_downsample)
         measurement = counts.astype(np.float32)

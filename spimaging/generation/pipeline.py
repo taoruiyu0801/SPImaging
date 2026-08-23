@@ -1,7 +1,6 @@
 import argparse
 from pathlib import Path
 import csv
-import tempfile
 
 import numpy as np
 from tqdm import tqdm
@@ -9,6 +8,7 @@ from tqdm import tqdm
 from spimaging.cli import (
     ArgumentParser,
     HelpFormatter,
+    add_device_arguments,
     create_output_directory,
     finite_float,
     nonnegative_float,
@@ -162,6 +162,12 @@ def build_parser():
             "stale sample_*.npz files and index.csv from earlier runs are removed."
         ),
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue a compatible incomplete generation from its integrity-checked partial manifest.",
+    )
+    add_device_arguments(parser)
 
     return parser
 
@@ -212,6 +218,9 @@ def publish_generated_output(parser, staging_dir, output_dir, overwrite):
     index_path = output_dir / "index.csv"
     if index_path.exists():
         existing_owned.append(index_path)
+    generation_manifest = output_dir / "generation_manifest.json"
+    if generation_manifest.exists():
+        existing_owned.append(generation_manifest)
 
     produced = {path.name for path in staging_dir.iterdir() if path.is_file()}
     try:
@@ -246,7 +255,12 @@ def generate_one_sample(args, rgb, depth, mean_signal_photons, mean_background_p
             mean_signal_photons=mean_signal_photons,
             sbr=sbr,
         )
-        counts, xhat = simulate_with_deepinverse(x, bins=args.bins, irf_sigma=args.irf_sigma)
+        counts, xhat = simulate_with_deepinverse(
+            x,
+            bins=args.bins,
+            irf_sigma=args.irf_sigma,
+            device=getattr(args, "_torch_device", None),
+        )
         x_to_save = x if args.save_x else None
 
     elif args.surface_model == "neighborhood_mix":
@@ -335,9 +349,9 @@ def generate_one_sample(args, rgb, depth, mean_signal_photons, mean_background_p
 # =========================================================
 # Main
 # =========================================================
-def main():
+def main(argv=None, *, event_callback=None, cancel_check=None):
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     final_output_dir = validate_args(parser, args)
 
     if args.surface_model == "single":
@@ -386,17 +400,87 @@ def main():
             pairs = pairs[:args.limit]
         validate_source_image_signatures(parser, pairs, args.dataset_mode)
 
+    from spimaging.generation.recovery import (
+        GenerationResumeError,
+        cleanup_completed_session,
+        generation_config_fingerprint,
+        prepare_generation_session,
+        source_fingerprint,
+    )
+    from spimaging.training_common.events import cancellation_requested, emit_event
+
+    if args.dataset_mode == "labeled":
+        total_candidates = int(images.shape[0])
+        if args.limit is not None:
+            total_candidates = min(total_candidates, args.limit)
+        source_paths = [Path(args.nyu_mat)]
+    else:
+        total_candidates = len(pairs)
+        second_key = "depth_path" if args.dataset_mode == "raw" else "disp_path"
+        source_paths = [path for item in pairs for path in (item["rgb_path"], item[second_key])]
+
     create_output_directory(parser, final_output_dir.parent, option="parent of --output_dir")
     try:
-        staging_context = tempfile.TemporaryDirectory(
-            prefix=f".{final_output_dir.name or 'spad-output'}-",
-            dir=final_output_dir.parent,
+        session = prepare_generation_session(
+            final_output_dir,
+            config_hash=generation_config_fingerprint(args),
+            source_hash=source_fingerprint(source_paths),
+            total_candidates=total_candidates,
+            resume=args.resume,
+            overwrite=args.overwrite,
         )
-    except OSError as exc:
-        parser.error(f"cannot create staging directory for --output_dir {final_output_dir}: {exc}")
-    output_dir = Path(staging_context.name)
+    except (GenerationResumeError, OSError) as exc:
+        parser.error(f"cannot prepare resumable generation for --output_dir {final_output_dir}: {exc}")
+    output_dir = session.directory
 
-    index_rows = []
+    selection = None
+    if args.surface_model == "single":
+        from spimaging.training_common.device import get_torch_device
+
+        selection = get_torch_device(
+            mode=args.device,
+            gpu_index=args.gpu_index,
+            return_selection=True,
+        )
+        args._torch_device = selection.device
+        emit_event(
+            "device",
+            callback=event_callback,
+            requested=selection.requested,
+            selected=str(selection.device),
+            gpu_index=selection.gpu_index,
+            fallback=selection.fallback,
+            reason=selection.reason,
+        )
+        if selection.fallback:
+            emit_event("warning", callback=event_callback, code="device_fallback", message=selection.reason)
+
+    index_rows = session.index_rows
+    completed_ids = session.completed_ids
+    emit_event(
+        "stage",
+        callback=event_callback,
+        stage="generation",
+        status="started",
+        total=total_candidates,
+        completed=len(completed_ids),
+        resumed=args.resume,
+    )
+
+    def check_cancelled(next_sample):
+        if cancellation_requested(cancel_check):
+            session.mark_interrupted("cancelled")
+            emit_event(
+                "cancelled",
+                callback=event_callback,
+                phase="generation",
+                completed=len(session.completed_ids),
+                total=total_candidates,
+                next_sample=next_sample,
+                partial_manifest=str(output_dir / ".generation_partial.json"),
+            )
+            print(f"Cancelled safely. Resume with --resume; partial data is in: {output_dir}")
+            raise SystemExit(130)
 
     if args.dataset_mode == "labeled":
         n_samples = images.shape[0]
@@ -404,6 +488,9 @@ def main():
             n_samples = min(n_samples, args.limit)
 
         for idx in tqdm(range(n_samples), desc=f"Generating SPAD dataset from labeled NYUv2 ({args.surface_model})"):
+            check_cancelled(idx)
+            if idx in completed_ids:
+                continue
             rgb = images[idx]
             depth = depths[idx]
             mean_signal_photons, mean_background_photons, sbr = get_simulation_parameters(args.param_idx)
@@ -422,24 +509,37 @@ def main():
             sample_path = output_dir / f"sample_{idx:05d}.npz"
             np.savez_compressed(sample_path, **save_dict)
 
-            index_rows.append(
-                {
-                    "sample_id": idx,
-                    "file": sample_path.name,
-                    "source_mode": "labeled",
-                    "scene": "",
-                    "rgb_file": "",
-                    "depth_file": "",
-                    "time_diff": "",
-                    "mean_signal_photons": mean_signal_photons,
-                    "mean_background_photons": mean_background_photons,
-                    "sbr": sbr,
-                    "surface_model": args.surface_model,
-                }
+            row = {
+                "sample_id": idx,
+                "file": sample_path.name,
+                "source_mode": "labeled",
+                "scene": "",
+                "rgb_file": "",
+                "depth_file": "",
+                "time_diff": "",
+                "mean_signal_photons": mean_signal_photons,
+                "mean_background_photons": mean_background_photons,
+                "sbr": sbr,
+                "surface_model": args.surface_model,
+            }
+            index_rows.append(row)
+            session.record_sample(idx, sample_path, row)
+            completed_ids.add(idx)
+            emit_event(
+                "sample",
+                callback=event_callback,
+                phase="generation",
+                sample_id=idx,
+                completed=len(completed_ids),
+                total=total_candidates,
+                artifact=str(sample_path),
             )
 
     elif args.dataset_mode == "raw":
         for idx, item in enumerate(tqdm(pairs, desc=f"Generating SPAD dataset from raw NYUv2 ({args.surface_model})")):
+            check_cancelled(idx)
+            if idx in completed_ids:
+                continue
             try:
                 rgb, depth = load_raw_pair(item["rgb_path"], item["depth_path"])
             except (OSError, ValueError) as exc:
@@ -470,24 +570,37 @@ def main():
             sample_path = output_dir / f"sample_{idx:05d}.npz"
             np.savez_compressed(sample_path, **save_dict)
 
-            index_rows.append(
-                {
-                    "sample_id": idx,
-                    "file": sample_path.name,
-                    "source_mode": "raw",
-                    "scene": item["scene"],
-                    "rgb_file": item["rgb_path"].name,
-                    "depth_file": item["depth_path"].name,
-                    "time_diff": item["dt"],
-                    "mean_signal_photons": mean_signal_photons,
-                    "mean_background_photons": mean_background_photons,
-                    "sbr": sbr,
-                    "surface_model": args.surface_model,
-                }
+            row = {
+                "sample_id": idx,
+                "file": sample_path.name,
+                "source_mode": "raw",
+                "scene": item["scene"],
+                "rgb_file": item["rgb_path"].name,
+                "depth_file": item["depth_path"].name,
+                "time_diff": item["dt"],
+                "mean_signal_photons": mean_signal_photons,
+                "mean_background_photons": mean_background_photons,
+                "sbr": sbr,
+                "surface_model": args.surface_model,
+            }
+            index_rows.append(row)
+            session.record_sample(idx, sample_path, row)
+            completed_ids.add(idx)
+            emit_event(
+                "sample",
+                callback=event_callback,
+                phase="generation",
+                sample_id=idx,
+                completed=len(completed_ids),
+                total=total_candidates,
+                artifact=str(sample_path),
             )
 
     else:  # middlebury
         for idx, item in enumerate(tqdm(pairs, desc=f"Generating SPAD dataset from Middlebury ({args.surface_model})")):
+            check_cancelled(idx)
+            if idx in completed_ids:
+                continue
             try:
                 rgb, depth = load_middlebury_pair(
                     item["rgb_path"],
@@ -517,22 +630,33 @@ def main():
             sample_path = output_dir / f"sample_{idx:05d}.npz"
             np.savez_compressed(sample_path, **save_dict)
 
-            index_rows.append(
-                {
-                    "sample_id": idx,
-                    "file": sample_path.name,
-                    "source_mode": "middlebury",
-                    "scene": item["scene"],
-                    "rgb_file": item["rgb_path"].name,
-                    "depth_file": item["disp_path"].name,
-                    "time_diff": "",
-                    "mean_signal_photons": mean_signal_photons,
-                    "mean_background_photons": mean_background_photons,
-                    "sbr": sbr,
-                    "surface_model": args.surface_model,
-                }
+            row = {
+                "sample_id": idx,
+                "file": sample_path.name,
+                "source_mode": "middlebury",
+                "scene": item["scene"],
+                "rgb_file": item["rgb_path"].name,
+                "depth_file": item["disp_path"].name,
+                "time_diff": "",
+                "mean_signal_photons": mean_signal_photons,
+                "mean_background_photons": mean_background_photons,
+                "sbr": sbr,
+                "surface_model": args.surface_model,
+            }
+            index_rows.append(row)
+            session.record_sample(idx, sample_path, row)
+            completed_ids.add(idx)
+            emit_event(
+                "sample",
+                callback=event_callback,
+                phase="generation",
+                sample_id=idx,
+                completed=len(completed_ids),
+                total=total_candidates,
+                artifact=str(sample_path),
             )
 
+    index_rows.sort(key=lambda row: int(row["sample_id"]))
     with open(output_dir / "index.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
@@ -553,10 +677,25 @@ def main():
         writer.writeheader()
         writer.writerows(index_rows)
 
+    session.complete()
     publish_generated_output(parser, output_dir, final_output_dir, args.overwrite)
-    staging_context.cleanup()
+    try:
+        cleanup_completed_session(session)
+    except GenerationResumeError as exc:
+        parser.error(f"generated output was published but staging cleanup failed: {exc}")
+    if selection is not None:
+        print(f"Device: {selection.device}")
+        if selection.fallback:
+            print(f"Device selection: {selection.reason}")
     print("Done.")
     print(f"Saved {len(index_rows)} samples to: {final_output_dir}")
+    emit_event(
+        "completed",
+        callback=event_callback,
+        phase="generation",
+        samples=len(index_rows),
+        output_dir=str(final_output_dir),
+    )
 
 
 if __name__ == "__main__":

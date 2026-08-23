@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 from pathlib import Path
 from typing import Iterable
-import zipfile
 
 
 HelpFormatter = argparse.ArgumentDefaultsHelpFormatter
@@ -100,6 +100,31 @@ def positive_odd_int(value: str) -> int:
     return number
 
 
+def add_device_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the shared explicit device controls without importing PyTorch."""
+
+    device_default = os.environ.get("SPIMAGING_DEVICE", "auto").strip().lower()
+    if device_default not in {"auto", "cuda", "cpu"}:
+        device_default = "auto"
+    gpu_default = os.environ.get("SPIMAGING_GPU_INDEX", "0").strip()
+    try:
+        gpu_default = str(nonnegative_int(gpu_default))
+    except (argparse.ArgumentTypeError, ValueError):
+        gpu_default = "0"
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cuda", "cpu"),
+        default=device_default,
+        help="Execution device; CUDA requests fall back to CPU with an explanation when unavailable.",
+    )
+    parser.add_argument(
+        "--gpu_index",
+        type=nonnegative_int,
+        default=gpu_default,
+        help="Zero-based NVIDIA GPU index used by auto/cuda device modes.",
+    )
+
+
 def require_directory(parser: argparse.ArgumentParser, value: str, option: str) -> Path:
     path = Path(value)
     if not path.exists():
@@ -144,15 +169,12 @@ def validate_npz_archive(
     option: str,
     required_keys: Iterable[str] = (),
 ) -> Path:
-    try:
-        with zipfile.ZipFile(path) as archive:
-            keys = {Path(name).stem for name in archive.namelist() if name.endswith(".npy")}
-    except (OSError, zipfile.BadZipFile) as exc:
-        parser.error(f"{option} is not a readable .npz archive: {path} ({exc})")
+    from spimaging.training_common.security import UnsafeArchiveError, inspect_npz_archive
 
-    missing = sorted(set(required_keys) - keys)
-    if missing:
-        parser.error(f"{option} is missing required field(s) {', '.join(missing)}: {path}")
+    try:
+        inspect_npz_archive(path, required_keys=required_keys)
+    except UnsafeArchiveError as exc:
+        parser.error(f"{option} is not a safe readable .npz archive: {path} ({exc})")
     return path
 
 

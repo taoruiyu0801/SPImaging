@@ -44,18 +44,33 @@ def save_training_checkpoint(
     method_family,
     best_metric,
     best_metric_name,
+    *,
+    resume=None,
+    metrics=None,
+    status="running",
 ):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "epoch": epoch,
-            "args": vars(args),
-            "model_name": model_name,
-            "method_family": method_family,
-            best_metric_name: best_metric,
-        },
-        path,
-    )
+    payload = {
+        "checkpoint_schema_version": 1,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "epoch": int(epoch),
+        "args": vars(args),
+        "model_name": model_name,
+        "method_family": method_family,
+        "status": str(status),
+        best_metric_name: best_metric,
+    }
+    if resume is not None:
+        payload["resume"] = dict(resume)
+    if metrics is not None:
+        payload["metrics"] = dict(metrics)
+
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        torch.save(payload, temporary)
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
