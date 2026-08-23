@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import sqlite3
 from typing import Iterable
+import uuid
 
 from spimaging.appcore.config import RunConfig
 from spimaging.appcore.storage import RUN_STATUSES, ResultManifest, now_iso
@@ -29,8 +32,27 @@ class HistoryStore:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser().resolve()
+        self.recovered_corrupt_path: Path | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+        try:
+            self._initialize()
+        except sqlite3.DatabaseError:
+            self.recovered_corrupt_path = self._preserve_corrupt_database()
+            self._initialize()
+
+    def _preserve_corrupt_database(self) -> Path:
+        """Move an unreadable index aside; authoritative run directories stay untouched."""
+
+        backup = self.path.with_name(
+            f"{self.path.name}.corrupt-{uuid.uuid4().hex}"
+        )
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(self.path) + suffix)
+            if sidecar.exists():
+                os.replace(sidecar, Path(str(backup) + suffix))
+        if self.path.exists():
+            os.replace(self.path, backup)
+        return backup
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
@@ -38,7 +60,7 @@ class HistoryStore:
         return connection
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
@@ -56,6 +78,7 @@ class HistoryStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS runs_updated_idx ON runs(updated_at DESC)"
             )
+            connection.commit()
 
     def upsert(
         self,
@@ -66,7 +89,7 @@ class HistoryStore:
         if status not in RUN_STATUSES:
             raise ValueError(f"未知运行状态：{status}")
         updated_at = now_iso()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute(
                 """
                 INSERT INTO runs (
@@ -92,11 +115,12 @@ class HistoryStore:
                     json.dumps(summary or {}, ensure_ascii=False, allow_nan=False),
                 ),
             )
+            connection.commit()
 
     def list(self, *, limit: int = 100) -> list[HistoryRecord]:
         if limit < 1:
             raise ValueError("history limit 必须大于 0")
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             rows = connection.execute(
                 "SELECT * FROM runs ORDER BY updated_at DESC LIMIT ?", (limit,)
             ).fetchall()
@@ -115,7 +139,7 @@ class HistoryStore:
         ]
 
     def mark_interrupted(self) -> int:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             cursor = connection.execute(
                 """
                 UPDATE runs SET status='interrupted', updated_at=?
@@ -123,6 +147,7 @@ class HistoryStore:
                 """,
                 (now_iso(),),
             )
+            connection.commit()
             return cursor.rowcount
 
     def rebuild(self, run_roots: Iterable[str | Path]) -> tuple[int, list[str]]:
@@ -150,4 +175,3 @@ class HistoryStore:
                 except (OSError, ValueError, json.JSONDecodeError) as exc:
                     errors.append(f"{candidate}: {exc}")
         return imported, errors
-

@@ -130,6 +130,28 @@ class EventAndStorageTests(unittest.TestCase):
 
 
 class HistoryAndDiagnosticsTests(unittest.TestCase):
+    def test_corrupt_history_database_is_preserved_and_can_be_rebuilt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database = root / "history.sqlite3"
+            database.write_bytes(b"not a sqlite database")
+
+            history = HistoryStore(database)
+
+            self.assertEqual(history.list(), [])
+            self.assertIsNotNone(history.recovered_corrupt_path)
+            assert history.recovered_corrupt_path is not None
+            self.assertEqual(history.recovered_corrupt_path.read_bytes(), b"not a sqlite database")
+
+            config = RunConfig.new("noop", root / "runs" / "one")
+            storage = RunStorage(config)
+            manifest = storage.prepare()
+            manifest.set_status("succeeded")
+            storage.write_result(manifest)
+            imported, errors = history.rebuild((root / "runs",))
+            self.assertEqual((imported, errors), (1, []))
+            self.assertEqual(history.list()[0].run_id, config.run_id)
+
     def test_history_marks_interrupted_and_rebuilds_from_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
