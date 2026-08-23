@@ -11,4 +11,9 @@ Offscreen window construction, page navigation, dynamic forms, worker event hand
 - All tests pass without displaying a window or starting real training.
 
 ## Actual Result
-- Not run yet.
+- PASS on 2026-08-23.
+- Desktop pytest completed with `20 passed in 0.75s`.
+- `python -m spimaging.desktop --smoke-test` completed offscreen with exit code
+  `0`.
+- `python -m spimaging.desktop --version` printed
+  `SPImaging 0.2.0-beta.1` and exited `0`.
