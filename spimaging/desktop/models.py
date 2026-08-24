@@ -65,6 +65,16 @@ DEVICE_LABELS = {
     "cpu": "CPU",
 }
 
+
+def cuda_required() -> bool:
+    """Return whether this desktop was launched by the CUDA-only bootstrap."""
+
+    return os.environ.get("SPIMAGING_CUDA_REQUIRED", "").strip() == "1"
+
+
+def desktop_device_labels() -> dict[str, str]:
+    return {"cuda": DEVICE_LABELS["cuda"]} if cuda_required() else dict(DEVICE_LABELS)
+
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "interrupted"}
 RESUMABLE_STATUSES = {"failed", "cancelled", "interrupted"}
 _SAMPLE_INDEX = re.compile(r"(?:sample|input|prediction)[_-]?(\d+)", re.IGNORECASE)
@@ -836,7 +846,11 @@ class SettingsStore:
         self.defaults = defaults or ApplicationPaths.default()
 
     def default_settings(self) -> DesktopSettings:
-        return DesktopSettings(runs_dir=str(self.defaults.runs), cache_dir=str(self.defaults.cache))
+        return DesktopSettings(
+            device="cuda" if cuda_required() else "auto",
+            runs_dir=str(self.defaults.runs),
+            cache_dir=str(self.defaults.cache),
+        )
 
     def load(self) -> DesktopSettings:
         if not self.path.is_file():
@@ -851,6 +865,8 @@ class SettingsStore:
                 raise ValueError(f"设置包含未知字段：{', '.join(sorted(unknown))}")
             settings = DesktopSettings(**dict(raw))
             settings.validate()
+            if cuda_required() and settings.device != "cuda":
+                settings = replace(settings, device="cuda")
             return settings
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             # A damaged preferences file must not prevent the workbench opening.
@@ -892,6 +908,8 @@ __all__ = [
     "TERMINAL_STATUSES",
     "WORKFLOW_LABELS",
     "clone_run_config",
+    "cuda_required",
+    "desktop_device_labels",
     "load_sample_inspection",
     "next_run_directory",
 ]

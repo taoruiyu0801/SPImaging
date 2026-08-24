@@ -46,6 +46,9 @@ SetupLogging=yes
 
 [Files]
 Source: "{#MySourceRoot}\launcher\SPImaging.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MySourceRoot}\tools\uv.exe"; DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "{#MyRepoRoot}\spimaging\*"; DestDir: "{app}\app\spimaging"; Excludes: "__pycache__\*,*.pyc"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#MyRepoRoot}\public_demo\*"; DestDir: "{app}\app\public_demo"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#MyRepoRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyRepoRoot}\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyRepoRoot}\THIRD_PARTY_LICENSES.md"; DestDir: "{app}"; Flags: ignoreversion
@@ -64,5 +67,5 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 Filename: "{app}\SPImaging.exe"; Description: "启动 SPImaging"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; Intentionally empty: private runtimes, experiment records, and user exports live
-; outside {app} and are preserved for recovery/reinstall.
+; Intentionally empty: the optional CUDA engine, experiment records, and user
+; exports live outside {app} and are preserved for recovery/reinstall.

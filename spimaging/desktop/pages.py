@@ -18,7 +18,6 @@ from spimaging.desktop.controller import WorkerController
 from spimaging.desktop.dependency import require_pyside6
 from spimaging.desktop.i18n import tr
 from spimaging.desktop.models import (
-    DEVICE_LABELS,
     RESUMABLE_STATUSES,
     STATUS_LABELS,
     TERMINAL_STATUSES,
@@ -32,6 +31,8 @@ from spimaging.desktop.models import (
     RunHistoryModel,
     RunProgressState,
     SettingsStore,
+    cuda_required,
+    desktop_device_labels,
     next_run_directory,
 )
 from spimaging.desktop.widgets import (
@@ -345,12 +346,17 @@ class ExperimentPage(QWidget):
 
         compute = SectionCard(
             tr("ExperimentPage", "设备与执行"),
-            tr("ExperimentPage", "Auto 优先 NVIDIA；驱动或 CUDA 自检失败时 worker 会回退 CPU 并记录原因。"),
+            tr(
+                "ExperimentPage",
+                "安装版强制使用 NVIDIA CUDA；真实 CUDA 运算自检失败时任务不会启动。"
+                if cuda_required()
+                else "Auto 优先 NVIDIA；源代码模式仍可显式选择 CPU。",
+            ),
         )
         compute_form = QFormLayout()
         self.device_combo = QComboBox()
         self.device_combo.setObjectName("deviceCombo")
-        for key, label in DEVICE_LABELS.items():
+        for key, label in desktop_device_labels().items():
             self.device_combo.addItem(tr("DeviceLabels", label), key)
         self.device_combo.setCurrentIndex(max(0, self.device_combo.findData(settings.device)))
         self.gpu_spin = QSpinBox()
@@ -1069,7 +1075,7 @@ class SettingsPage(QWidget):
         device = SectionCard(tr("SettingsPage", "计算设备"))
         device_form = QFormLayout()
         self.device_combo = QComboBox()
-        for key, label in DEVICE_LABELS.items():
+        for key, label in desktop_device_labels().items():
             self.device_combo.addItem(tr("DeviceLabels", label), key)
         self.device_combo.setCurrentIndex(max(0, self.device_combo.findData(settings.device)))
         self.gpu_spin = QSpinBox()
@@ -1103,7 +1109,7 @@ class SettingsPage(QWidget):
         )
         self.update_check = QCheckBox(tr("SettingsPage", "每 24 小时最多自动检查一次更新"))
         self.update_check.setChecked(settings.update_checks)
-        self.repair_button = QPushButton(tr("SettingsPage", "修复私有运行环境"))
+        self.repair_button = QPushButton(tr("SettingsPage", "重新检测或安装 CUDA 计算引擎"))
         self.diagnostic_button = QPushButton(tr("SettingsPage", "导出脱敏诊断包…"))
         row = QHBoxLayout()
         row.addWidget(self.repair_button)
@@ -1159,7 +1165,7 @@ class SettingsPage(QWidget):
         self._probe.start()
 
     def _probe_finished(self, reason: str, fallback: bool) -> None:
-        prefix = tr("SettingsPage", "已回退 CPU：") if fallback else tr("SettingsPage", "设备可用：")
+        prefix = tr("SettingsPage", "CUDA 不可用：") if fallback else tr("SettingsPage", "CUDA 可用：")
         self.probe_result.setText(prefix + reason)
 
     def _export_diagnostics(self) -> None:

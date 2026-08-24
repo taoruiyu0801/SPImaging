@@ -3,6 +3,7 @@ param(
     [string]$Version = "0.2.0-beta.1",
     [string]$OutputDirectory = (Join-Path $PSScriptRoot "..\out"),
     [string]$IsccPath,
+    [string]$UvPath,
     [string]$InnoSignToolCommand,
     [string]$SigningPfxPath,
     [string]$CertificateThumbprint
@@ -26,6 +27,17 @@ if (-not $IsccPath -and $env:LOCALAPPDATA) {
 if (-not $IsccPath -or -not (Test-Path -LiteralPath $IsccPath -PathType Leaf)) {
     throw "Missing external prerequisite: Inno Setup 6 ISCC.exe. Launcher and release assets remain usable."
 }
+if (-not $UvPath) {
+    $uvCommand = Get-Command uv.exe -ErrorAction SilentlyContinue
+    if (-not $uvCommand) { $uvCommand = Get-Command uv -ErrorAction SilentlyContinue }
+    if ($uvCommand) { $UvPath = $uvCommand.Source }
+}
+if (-not $UvPath -or -not (Test-Path -LiteralPath $UvPath -PathType Leaf)) {
+    throw "Missing build prerequisite: uv.exe. The installer bundles uv, but never Conda or PyTorch."
+}
+$toolsRoot = Join-Path $outputRoot "tools"
+New-Item -ItemType Directory -Force -Path $toolsRoot | Out-Null
+Copy-Item -LiteralPath ([IO.Path]::GetFullPath($UvPath)) -Destination (Join-Path $toolsRoot "uv.exe") -Force
 $launcher = Join-Path $outputRoot "launcher\SPImaging.exe"
 if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
     throw "Missing launcher artifact: $launcher. Run Build-Launcher.ps1 first."

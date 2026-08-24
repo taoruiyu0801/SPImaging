@@ -19,7 +19,12 @@ class DeviceSelection:
 
 
 def select_torch_device(mode: str = "auto", gpu_index: int = 0) -> DeviceSelection:
-    """Select and smoke-test a device, falling back to CPU with a reason."""
+    """Select and smoke-test a device.
+
+    ``auto`` retains the historical CLI fallback.  An explicit ``cuda``
+    request is strict: the desktop product must fail visibly instead of
+    silently running a multi-hour job on CPU.
+    """
 
     import torch
 
@@ -39,69 +44,54 @@ def select_torch_device(mode: str = "auto", gpu_index: int = 0) -> DeviceSelecti
             fallback=False,
         )
 
-    try:
-        cuda_available = bool(torch.cuda.is_available())
-    except Exception as exc:  # driver probing can fail outside normal torch errors
+    def unavailable(reason: str) -> DeviceSelection:
+        if requested == "cuda":
+            raise RuntimeError(reason)
         return DeviceSelection(
             device=torch.device("cpu"),
             requested=requested,
             gpu_index=gpu_index,
-            reason=f"CUDA probe failed ({exc}); using CPU.",
+            reason=reason + "; using CPU.",
             fallback=True,
         )
 
+    try:
+        cuda_available = bool(torch.cuda.is_available())
+    except Exception as exc:  # driver probing can fail outside normal torch errors
+        return unavailable(f"CUDA probe failed ({exc})")
+
     if not cuda_available:
-        return DeviceSelection(
-            device=torch.device("cpu"),
-            requested=requested,
-            gpu_index=gpu_index,
-            reason="CUDA is not available in this runtime or driver; using CPU.",
-            fallback=True,
-        )
+        return unavailable("CUDA is not available in this runtime or driver")
 
     try:
         device_count = int(torch.cuda.device_count())
     except Exception as exc:
-        return DeviceSelection(
-            device=torch.device("cpu"),
-            requested=requested,
-            gpu_index=gpu_index,
-            reason=f"CUDA device enumeration failed ({exc}); using CPU.",
-            fallback=True,
-        )
+        return unavailable(f"CUDA device enumeration failed ({exc})")
     logical_gpu_index = gpu_index
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
     visible_tokens = [token.strip() for token in visible_devices.split(",") if token.strip()]
     if len(visible_tokens) == 1 and visible_tokens[0] == str(gpu_index):
         logical_gpu_index = 0
     if logical_gpu_index >= device_count:
-        return DeviceSelection(
-            device=torch.device("cpu"),
-            requested=requested,
-            gpu_index=gpu_index,
-            reason=(
-                f"CUDA device index {gpu_index} is unavailable "
-                f"({device_count} device(s) detected); using CPU."
-            ),
-            fallback=True,
+        return unavailable(
+            f"CUDA device index {gpu_index} is unavailable ({device_count} device(s) detected)"
         )
 
     candidate = torch.device(f"cuda:{logical_gpu_index}")
     try:
-        torch.empty(1, device=candidate)
+        # Allocation alone does not detect an old wheel that can enumerate a
+        # new GPU but ships no kernels for its architecture.
+        value = torch.arange(64, dtype=torch.float32, device=candidate)
+        value = (value + 1).sum()
+        value.item()
+        torch.cuda.synchronize(logical_gpu_index)
         name = torch.cuda.get_device_name(logical_gpu_index)
     except Exception as exc:
         try:
             torch.cuda.empty_cache()
         except Exception:
             pass
-        return DeviceSelection(
-            device=torch.device("cpu"),
-            requested=requested,
-            gpu_index=gpu_index,
-            reason=f"CUDA device {gpu_index} self-test failed ({exc}); using CPU.",
-            fallback=True,
-        )
+        return unavailable(f"CUDA device {gpu_index} self-test failed ({exc})")
 
     return DeviceSelection(
         device=candidate,

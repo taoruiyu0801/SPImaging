@@ -137,7 +137,7 @@ class MainWindow(QMainWindow):
         topbar_layout.setContentsMargins(24, 0, 24, 0)
         self.context_label = QLabel()
         self.context_label.setStyleSheet("font-weight: 600; color: #42566b;")
-        self.runtime_label = QLabel(tr("MainWindow", "本地运行 · 不上传数据"))
+        self.runtime_label = QLabel(tr("MainWindow", "CUDA 本地运行 · 不上传数据"))
         self.runtime_label.setObjectName("muted")
         topbar_layout.addWidget(self.context_label)
         topbar_layout.addStretch(1)
@@ -305,7 +305,7 @@ class MainWindow(QMainWindow):
                 tr("MainWindow", "运行环境修复"),
                 tr(
                     "MainWindow",
-                    "源代码模式没有私有启动器；请在当前 Conda 环境中修复依赖。安装版会在这里重新校验并原子切换运行时。",
+                    "源代码模式没有安装启动器；请在当前 Python 环境中修复 CUDA PyTorch。安装版会重新检测或安装计算引擎。",
                 ),
             )
             return
@@ -318,8 +318,8 @@ class MainWindow(QMainWindow):
             return
         answer = QMessageBox.question(
             self,
-            tr("MainWindow", "修复私有运行环境"),
-            tr("MainWindow", "软件将关闭，并由启动器重新下载或校验所选运行时。是否继续？"),
+            tr("MainWindow", "修复 CUDA 计算引擎"),
+            tr("MainWindow", "软件将关闭，由启动器重新检测或安装 CUDA 计算引擎。不会安装显卡驱动，也不会使用 Conda。是否继续？"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -327,9 +327,7 @@ class MainWindow(QMainWindow):
             return
         command = [
             str(launcher),
-            "--repair",
-            "--runtime",
-            self.settings.device,
+            "--repair-engine",
             "--wait-for-pid",
             str(os.getpid()),
         ]

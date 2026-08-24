@@ -20,6 +20,15 @@ from .bootstrap import ProvisionResult, Provisioner, launch_desktop
 from .device import probe_nvidia
 from .download import DownloadTransport, LocalDirectoryTransport, UrllibTransport, fetch_bytes
 from .errors import LauncherError
+from .engine import (
+    CudaEngineManager,
+    EngineProbe,
+    NvidiaDevice,
+    launch_desktop_with_engine,
+    probe_nvidia_device,
+    resolve_app_root,
+    select_cuda_profile,
+)
 from .locking import InterProcessLock
 from .manifest import NvidiaCapability, ReleaseManifest, compare_semver, select_runtime_asset
 from .signing import WindowsSignatureVerifier
@@ -69,6 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check-now", action="store_true", help="ignore the 24-hour update-check interval")
     parser.add_argument("--accept-update", action="store_true", help="allow update without an interactive confirmation")
     parser.add_argument("--wait-for-pid", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--engine-python", type=Path, help="优先验证指定的 CUDA Python 环境")
+    parser.add_argument("--app-root", type=Path, help="安装版应用代码目录")
+    parser.add_argument("--gpu-index", type=int, default=0, help="必须通过自检的 NVIDIA GPU 编号")
+    parser.add_argument("--install-engine", action="store_true", help="缺失时安装 CUDA 计算引擎")
+    parser.add_argument("--repair-engine", action="store_true", help="重新安装并验证 CUDA 计算引擎")
+    parser.add_argument("--legacy-runtime", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -433,13 +448,223 @@ def _run_gui(args: argparse.Namespace) -> int:
     return 0
 
 
+def _launcher_executable() -> Path | None:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve()
+    return None
+
+
+def _legacy_runtime_requested(args: argparse.Namespace) -> bool:
+    """Keep the previous manifest runtime available only for old beta media."""
+
+    return bool(
+        args.legacy_runtime
+        or args.manifest_file is not None
+        or args.manifest_url is not None
+        or args.asset_dir is not None
+    )
+
+
+def _engine_summary(probe: EngineProbe) -> str:
+    capability = f"sm_{probe.compute_capability[0]}{probe.compute_capability[1]}"
+    memory = f"{probe.total_memory / 1024**3:.1f} GiB" if probe.total_memory else "未知显存"
+    return (
+        f"{probe.device_name} · PyTorch {probe.torch_version} · CUDA {probe.cuda_version} · "
+        f"{capability} · {memory}"
+    )
+
+
+def _run_engine_headless(args: argparse.Namespace) -> int:
+    app_root = resolve_app_root(args.app_root)
+    manager = CudaEngineManager(args.install_root, app_root)
+    device = probe_nvidia_device()
+    if args.install_engine or args.repair_engine:
+        probe = manager.install(device, gpu_index=args.gpu_index, progress=print)
+    else:
+        probe, attempts = manager.find(
+            explicit=args.engine_python,
+            gpu_index=args.gpu_index,
+            progress=print,
+        )
+        if probe is None:
+            detail = attempts[-1].reason if attempts else "没有找到 Python 环境"
+            profile = select_cuda_profile(device)
+            raise LauncherError(
+                f"没有可用的 CUDA 计算引擎（{detail}）。可安装配置：{profile.profile_id}；"
+                "请使用 --install-engine。"
+            )
+    print(_engine_summary(probe))
+    if not args.no_launch:
+        process = launch_desktop_with_engine(
+            probe,
+            app_root,
+            launcher_executable=_launcher_executable(),
+        )
+        return int(process.wait())
+    return 0
+
+
+def _run_engine_gui(args: argparse.Namespace) -> int:
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except ImportError as error:
+        raise LauncherError("启动器图形组件不可用，请使用 --headless 查看诊断") from error
+
+    app_root = resolve_app_root(args.app_root)
+    manager = CudaEngineManager(args.install_root, app_root)
+    root = tk.Tk()
+    root.title("SPImaging CUDA 启动器")
+    root.geometry("620x340")
+    root.resizable(False, False)
+    status = tk.StringVar(value="正在检测 NVIDIA CUDA 环境……")
+    detail = tk.StringVar(value="将优先复用已有且通过真实 CUDA 运算的 PyTorch 环境。")
+    frame = ttk.Frame(root, padding=24)
+    frame.pack(fill="both", expand=True)
+    ttk.Label(frame, text="SPImaging", font=("Microsoft YaHei UI", 20, "bold")).pack(anchor="w")
+    ttk.Label(frame, text="CUDA 完整实验工作台", font=("Microsoft YaHei UI", 10)).pack(anchor="w", pady=(2, 14))
+    ttk.Label(frame, textvariable=status, font=("Microsoft YaHei UI", 11)).pack(anchor="w", pady=(4, 4))
+    ttk.Label(frame, textvariable=detail, wraplength=560).pack(anchor="w")
+    bar = ttk.Progressbar(frame, mode="indeterminate")
+    bar.pack(fill="x", pady=(20, 16))
+    actions = ttk.Frame(frame)
+    actions.pack(fill="x")
+    install_button = ttk.Button(actions, text="一键安装 CUDA 计算引擎", state="disabled")
+    install_button.pack(side="left")
+    close_button = ttk.Button(actions, text="关闭", command=root.destroy)
+    close_button.pack(side="right")
+    events: queue.Queue[tuple[str, object]] = queue.Queue()
+    selected_device: NvidiaDevice | None = None
+    launched_process: subprocess.Popen[bytes] | None = None
+    busy = True
+
+    def emit_detail(message: str) -> None:
+        events.put(("detail", message))
+
+    def detect() -> None:
+        try:
+            device = probe_nvidia_device()
+            events.put(("device", device))
+            emit_detail(
+                f"检测到 {device.name}，驱动 {device.driver_version}，"
+                f"计算能力 {device.compute_capability[0]}.{device.compute_capability[1]}。"
+            )
+            if args.repair_engine:
+                result = manager.install(device, gpu_index=args.gpu_index, progress=emit_detail)
+                events.put(("done", result))
+                return
+            result, attempts = manager.find(
+                explicit=args.engine_python,
+                gpu_index=args.gpu_index,
+                progress=emit_detail,
+            )
+            if result is not None:
+                events.put(("done", result))
+                return
+            profile = select_cuda_profile(device)
+            last = attempts[-1].reason if attempts else "没有发现 Python 环境"
+            if args.install_engine:
+                events.put(("detail", f"没有可复用环境，将安装 {profile.profile_id}：{last}"))
+                result = manager.install(device, gpu_index=args.gpu_index, progress=emit_detail)
+                events.put(("done", result))
+            else:
+                events.put(("missing", (device, profile.profile_id, last)))
+        except Exception as error:
+            events.put(("error", error))
+
+    def install_selected() -> None:
+        nonlocal busy
+        if selected_device is None or busy:
+            return
+        accepted = messagebox.askyesno(
+            "安装 CUDA 计算引擎",
+            "将联网下载 Python 和 PyTorch CUDA 组件，至少需要 8 GiB 可用磁盘空间。\n\n"
+            "不会安装或修改 NVIDIA 驱动，也不会使用 Conda。是否继续？",
+            parent=root,
+        )
+        if not accepted:
+            return
+        busy = True
+        install_button.configure(state="disabled")
+        close_button.configure(state="disabled")
+        status.set("正在安装 CUDA 计算引擎……")
+        bar.start(12)
+
+        def work() -> None:
+            try:
+                result = manager.install(selected_device, gpu_index=args.gpu_index, progress=emit_detail)
+                events.put(("done", result))
+            except Exception as error:
+                events.put(("error", error))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    install_button.configure(command=install_selected)
+
+    def poll() -> None:
+        nonlocal selected_device, launched_process, busy
+        try:
+            while True:
+                kind, payload = events.get_nowait()
+                if kind == "detail":
+                    detail.set(str(payload))
+                elif kind == "device":
+                    selected_device = payload  # type: ignore[assignment]
+                elif kind == "missing":
+                    device, profile, last = payload  # type: ignore[misc]
+                    selected_device = device
+                    busy = False
+                    bar.stop()
+                    status.set("需要 CUDA 计算引擎")
+                    detail.set(f"将使用兼容配置 {profile}。最近一次检测：{last}")
+                    install_button.configure(state="normal")
+                elif kind == "done":
+                    probe = payload  # type: ignore[assignment]
+                    busy = False
+                    bar.stop()
+                    bar.configure(mode="determinate", maximum=100, value=100)
+                    status.set("CUDA 环境已通过自检")
+                    detail.set(_engine_summary(probe))
+                    install_button.configure(state="disabled")
+                    launched_process = launch_desktop_with_engine(
+                        probe,
+                        app_root,
+                        launcher_executable=_launcher_executable(),
+                    )
+                    root.after(500, root.destroy)
+                elif kind == "error":
+                    busy = False
+                    bar.stop()
+                    status.set("CUDA 启动失败")
+                    detail.set(str(payload))
+                    close_button.configure(state="normal")
+                    if selected_device is not None:
+                        install_button.configure(state="normal")
+                    messagebox.showerror("SPImaging CUDA 启动失败", str(payload), parent=root)
+        except queue.Empty:
+            pass
+        if root.winfo_exists():
+            root.after(100, poll)
+
+    bar.start(12)
+    close_button.configure(state="disabled" if args.repair_engine else "normal")
+    threading.Thread(target=detect, daemon=True).start()
+    root.after(100, poll)
+    root.mainloop()
+    if launched_process is not None:
+        return int(launched_process.wait())
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _wait_for_pid(args.wait_for_pid)
     try:
         instance_path = args.install_root.expanduser().resolve() / "metadata" / "launcher-instance.lock"
         with InterProcessLock(instance_path, purpose="启动器单实例"):
-            return _run_headless(args) if args.headless or args.dry_run else _run_gui(args)
+            if _legacy_runtime_requested(args):
+                return _run_headless(args) if args.headless or args.dry_run else _run_gui(args)
+            return _run_engine_headless(args) if args.headless else _run_engine_gui(args)
     except LauncherError as error:
         if os.name == "nt" and not args.headless and not args.dry_run:
             try:

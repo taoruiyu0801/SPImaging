@@ -127,6 +127,9 @@ def test_device_selection_is_explicit_and_explains_fallback(monkeypatch) -> None
     assert automatic.fallback
     assert "CUDA is not available" in automatic.reason
 
+    with pytest.raises(RuntimeError, match="CUDA is not available"):
+        select_torch_device("cuda", 0)
+
 
 def test_resume_metadata_validates_dataset_signature_and_epoch_direction(tmp_path: Path) -> None:
     import torch
