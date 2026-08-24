@@ -158,6 +158,64 @@ def test_results_page_opens_manifest_and_renders_gallery(qapp, tmp_path: Path) -
     assert page.gallery_layout.count() >= 2  # one card plus stretch
 
 
+def test_successful_run_automatically_opens_its_result(qapp, tmp_path: Path) -> None:
+    from spimaging.appcore.storage import RunStorage
+
+    paths = _paths(tmp_path)
+    run = paths.runs / "completed-run"
+    config = RunConfig.new(
+        "noop",
+        run,
+        display_name="自动打开结果",
+        output={"history_db": str(paths.history_db)},
+    )
+    storage = RunStorage(config)
+    manifest = storage.prepare()
+    manifest.set_status("succeeded")
+    storage.write_result(manifest)
+
+    window = MainWindow(paths=paths, settings_store=SettingsStore(paths.settings_file, paths))
+    window.run_page.run_dir = str(run)
+    window.navigate("run")
+    window._handle_worker_completed("succeeded", 0)
+    qapp.processEvents()
+
+    assert window.stack.currentWidget() is window.results_page
+    assert window.results_page.model is not None
+    assert window.results_page.model.run_dir == run.resolve()
+    assert window.results_page.title_label.text() == "自动打开结果"
+    window.close()
+
+
+def test_results_navigation_loads_latest_successful_run(qapp, tmp_path: Path) -> None:
+    from spimaging.appcore.history import HistoryStore
+    from spimaging.appcore.storage import RunStorage
+
+    paths = _paths(tmp_path)
+    run = paths.runs / "previous-run"
+    config = RunConfig.new(
+        "noop",
+        run,
+        display_name="最近成功结果",
+        output={"history_db": str(paths.history_db)},
+    )
+    storage = RunStorage(config)
+    manifest = storage.prepare()
+    manifest.set_status("succeeded")
+    storage.write_result(manifest)
+    HistoryStore(paths.history_db).upsert(config, "succeeded")
+
+    window = MainWindow(paths=paths, settings_store=SettingsStore(paths.settings_file, paths))
+    assert window.results_page.model is None
+    window.navigate("results")
+    qapp.processEvents()
+
+    assert window.results_page.model is not None
+    assert window.results_page.model.run_dir == run.resolve()
+    assert window.results_page.title_label.text() == "最近成功结果"
+    window.close()
+
+
 def test_worker_python_prefers_windowed_interpreter_on_windows(tmp_path: Path) -> None:
     pythonw = tmp_path / "pythonw.exe"
     python = tmp_path / "python.exe"

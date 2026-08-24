@@ -185,12 +185,14 @@ class MainWindow(QMainWindow):
         self.history_page.resume_requested.connect(self.prepare_resume)
         self.settings_page.settings_saved.connect(self._settings_saved)
         self.settings_page.environment_repair_requested.connect(self._repair_environment)
-        self.worker.completed.connect(lambda _status, _code: self.refresh_history())
+        self.worker.completed.connect(self._handle_worker_completed)
         self.worker.completed.connect(self._finish_pending_close)
 
     def navigate(self, name: str) -> None:
         if name not in self.pages:
             raise ValueError(f"未知页面：{name}")
+        if name == "results" and self.results_page.model is None:
+            self._load_latest_successful_result()
         self.stack.setCurrentWidget(self.pages[name])
         self.nav_buttons[name].setChecked(True)
         self.context_label.setText(self.nav_buttons[name].text())
@@ -201,6 +203,22 @@ class MainWindow(QMainWindow):
         records = self.history_model.list(limit=100)
         self.home_page.set_history(records)
         self.history_page.refresh()
+
+    def _load_latest_successful_result(self) -> bool:
+        for record in self.history_model.list(limit=100):
+            if record.status != "succeeded":
+                continue
+            try:
+                self.results_page.load_result(record.run_dir)
+            except ValueError:
+                continue
+            return True
+        return False
+
+    def _handle_worker_completed(self, status: str, _exit_code: int) -> None:
+        self.refresh_history()
+        if status == "succeeded" and self.run_page.run_dir and not self._pending_close:
+            self.open_result(self.run_page.run_dir)
 
     def start_quick_demo(self) -> None:
         if not self.demo.available:
