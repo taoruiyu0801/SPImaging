@@ -1,0 +1,12 @@
+SPImaging
+Copyright 2026 SPImaging contributors
+
+This product includes software developed by the SPImaging contributors.
+SPImaging application source is licensed under the Apache License, Version 2.0.
+
+The generated files enumerated in public_demo/manifest.json are separately
+dedicated under CC0 1.0 Universal. They are generated from analytic geometry
+without external image data. See public_demo/CC0_NOTICE.md.
+
+This product depends on third-party components with separate licenses. See
+THIRD_PARTY_LICENSES.md and the license metadata shipped with the locked runtime.

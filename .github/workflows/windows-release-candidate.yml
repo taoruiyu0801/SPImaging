@@ -1,0 +1,347 @@
+name: Build Windows release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact app version (for example 0.2.0-beta.1)"
+        required: true
+        default: "0.2.0-beta.1"
+        type: string
+      runtime_version:
+        description: "Independent locked runtime version"
+        required: true
+        default: "0.2.0-runtime.1"
+        type: string
+      build_runtime:
+        description: "Build locked CPU/CUDA conda-pack assets"
+        required: true
+        default: false
+        type: boolean
+      publish:
+        description: "Publish to the matching v<version> tag after release-environment approval"
+        required: true
+        default: false
+        type: boolean
+      publish_unsigned_beta:
+        description: "Publish an explicitly unsigned prerelease and update the windows-beta manifest channel"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+  OUT_DIR: packaging/out
+  RELEASE_VERSION: ${{ inputs.version }}
+  RUNTIME_VERSION: ${{ inputs.runtime_version }}
+  REQUEST_BUILD_RUNTIME: ${{ inputs.build_runtime }}
+  REQUEST_PUBLISH: ${{ inputs.publish }}
+  REQUEST_PUBLISH_UNSIGNED_BETA: ${{ inputs.publish_unsigned_beta }}
+
+jobs:
+  validate-request:
+    runs-on: windows-latest
+    steps:
+      - name: Validate SemVer inputs and fail closed on unsafe publishing
+        shell: pwsh
+        run: |
+          $semver = '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$'
+          foreach ($entry in @(
+            @{ Name = 'version'; Value = $env:RELEASE_VERSION },
+            @{ Name = 'runtime_version'; Value = $env:RUNTIME_VERSION }
+          )) {
+            if ($entry.Value -notmatch $semver) {
+              throw "$($entry.Name) must be an exact SemVer value"
+            }
+          }
+          if ($env:REQUEST_PUBLISH -eq 'true' -and $env:REQUEST_PUBLISH_UNSIGNED_BETA -eq 'true') {
+            throw "Choose either signed publish or publish_unsigned_beta, never both"
+          }
+          if ($env:REQUEST_PUBLISH -eq 'true' -or $env:REQUEST_PUBLISH_UNSIGNED_BETA -eq 'true') {
+            $expectedRef = "refs/tags/v$env:RELEASE_VERSION"
+            if ($env:GITHUB_REF -ne $expectedRef) {
+              throw "Publishing requires dispatch from the exact tag $expectedRef"
+            }
+            if ($env:REQUEST_BUILD_RUNTIME -ne 'true') {
+              throw "Publishing requires build_runtime=true"
+            }
+          }
+          if ($env:REQUEST_PUBLISH_UNSIGNED_BETA -eq 'true' -and $env:RELEASE_VERSION -notmatch '-') {
+            throw "Unsigned publication is restricted to explicit SemVer prereleases"
+          }
+
+  launcher-and-app:
+    needs: validate-request
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install launcher build tools
+        run: python -m pip install --disable-pip-version-check pyinstaller pytest
+      - name: Test safe bootstrap library
+        run: python -m pytest -q tests/test_launcher.py tests/test_release_manifest.py
+      - name: Build deterministic app and launcher assets
+        shell: pwsh
+        run: |
+          packaging/scripts/Build-AppAsset.ps1 -Version $env:RELEASE_VERSION -OutputDirectory $env:OUT_DIR
+          packaging/scripts/Build-Launcher.ps1 -OutputDirectory "$env:OUT_DIR/launcher"
+      - name: Upload non-published app and launcher inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-app-launcher-${{ inputs.version }}
+          path: |
+            packaging/out/spimaging-app-*.zip*
+            packaging/out/launcher/SPImaging.exe
+          if-no-files-found: error
+
+  locked-runtimes:
+    needs: validate-request
+    if: inputs.build_runtime
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          activate-environment: build-tools
+          python-version: "3.10"
+      - name: Install build-host tools
+        shell: pwsh
+        run: conda install -y -n build-tools -c conda-forge conda-lock conda-pack
+      - name: Resolve archived locks and build conda-pack assets
+        shell: pwsh
+        run: |
+          packaging/scripts/New-RuntimeLocks.ps1
+          packaging/scripts/Build-Runtime.ps1 -Variant cpu -Version $env:RUNTIME_VERSION -OutputDirectory $env:OUT_DIR
+          packaging/scripts/Build-Runtime.ps1 -Variant cuda -Version $env:RUNTIME_VERSION -OutputDirectory $env:OUT_DIR
+      - name: Upload runtime release inputs without nested out/out paths
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-runtimes-${{ inputs.runtime_version }}
+          path: packaging/out/spimaging-runtime-*.zip*
+          if-no-files-found: error
+      - name: Archive locked dependency records separately
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-runtime-locks-${{ inputs.runtime_version }}
+          path: packaging/runtime/locks/*
+          if-no-files-found: error
+
+  installer-preview:
+    needs: launcher-and-app
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-app-launcher-${{ inputs.version }}
+          path: packaging/out
+      - name: Validate downloaded launcher layout
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath "$env:OUT_DIR/launcher/SPImaging.exe" -PathType Leaf)) {
+            throw "Downloaded launcher layout is invalid"
+          }
+      - name: Install external Inno prerequisite
+        run: choco install innosetup --no-progress -y
+      - name: Build explicitly unsigned beta installer preview
+        shell: pwsh
+        run: packaging/scripts/Build-Installer.ps1 -Version $env:RELEASE_VERSION -OutputDirectory $env:OUT_DIR
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SPImaging-Setup-unsigned-beta-${{ inputs.version }}
+          path: packaging/out/SPImaging-Setup-unsigned-beta.exe
+          if-no-files-found: error
+
+  publish:
+    needs: [launcher-and-app, locked-runtimes, installer-preview]
+    if: >-
+      inputs.publish && inputs.build_runtime &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      github.ref_name == format('v{0}', inputs.version)
+    runs-on: windows-latest
+    environment: windows-release-approval
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install publish prerequisites
+        run: choco install innosetup --no-progress -y
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-app-launcher-${{ inputs.version }}
+          path: packaging/out
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-runtimes-${{ inputs.runtime_version }}
+          path: packaging/out
+      - name: Validate flattened publish inputs
+        shell: pwsh
+        run: |
+          $required = @(
+            "$env:OUT_DIR/launcher/SPImaging.exe",
+            "$env:OUT_DIR/spimaging-app-$env:RELEASE_VERSION.zip",
+            "$env:OUT_DIR/spimaging-runtime-cpu-$env:RUNTIME_VERSION.zip",
+            "$env:OUT_DIR/spimaging-runtime-cuda-$env:RUNTIME_VERSION.zip"
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing publish input: $path" }
+          }
+          if (Test-Path -LiteralPath "$env:OUT_DIR/out") { throw "Refusing nested packaging/out/out artifact layout" }
+      - name: Require signing secret for publishing
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          SPIMAGING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          SIGNER_THUMBPRINT: ${{ secrets.WINDOWS_SIGNER_THUMBPRINT }}
+        run: |
+          if (-not $env:PFX_BASE64 -or -not $env:SPIMAGING_PFX_PASSWORD -or -not $env:SIGNER_THUMBPRINT) {
+            throw "Publishing is blocked until PFX, password, and signer-thumbprint secrets are configured."
+          }
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP/signing.pfx", [Convert]::FromBase64String($env:PFX_BASE64))
+      - name: Sign assets, launcher, manifest, and installer
+        shell: pwsh
+        env:
+          SPIMAGING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          SIGNER_THUMBPRINT: ${{ secrets.WINDOWS_SIGNER_THUMBPRINT }}
+        run: |
+          Get-ChildItem $env:OUT_DIR -Filter "spimaging-*.zip" | ForEach-Object {
+            packaging/scripts/Sign-Artifact.ps1 -Artifact $_.FullName -Mode DetachedCms -PfxPath "$env:RUNNER_TEMP/signing.pfx" -CertificateThumbprint $env:SIGNER_THUMBPRINT
+          }
+          packaging/scripts/Sign-Artifact.ps1 -Artifact "$env:OUT_DIR/launcher/SPImaging.exe" -Mode Authenticode -PfxPath "$env:RUNNER_TEMP/signing.pfx" -CertificateThumbprint $env:SIGNER_THUMBPRINT
+          packaging/scripts/New-ReleaseManifest.ps1 `
+            -Version $env:RELEASE_VERSION `
+            -RuntimeVersion $env:RUNTIME_VERSION `
+            -BaseUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$env:RELEASE_VERSION" `
+            -OutputDirectory $env:OUT_DIR `
+            -SignerThumbprint $env:SIGNER_THUMBPRINT
+          packaging/scripts/Sign-Artifact.ps1 -Artifact "$env:OUT_DIR/spimaging-release-manifest.json" -Mode DetachedCms -PfxPath "$env:RUNNER_TEMP/signing.pfx" -CertificateThumbprint $env:SIGNER_THUMBPRINT
+          packaging/scripts/Build-Installer.ps1 `
+            -Version $env:RELEASE_VERSION `
+            -OutputDirectory $env:OUT_DIR `
+            -SigningPfxPath "$env:RUNNER_TEMP/signing.pfx" `
+            -CertificateThumbprint $env:SIGNER_THUMBPRINT
+      - name: Publish only after all explicit gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = "v$env:RELEASE_VERSION"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) { throw "Create the GitHub release record manually before uploading assets." }
+          $assets = @(
+            "$env:OUT_DIR/spimaging-release-manifest.json",
+            "$env:OUT_DIR/spimaging-release-manifest.json.p7s",
+            "$env:OUT_DIR/SPImaging-Setup.exe"
+          )
+          $assets += Get-ChildItem $env:OUT_DIR -File | Where-Object {
+            $_.Name -match '^spimaging-.*\.zip\.(\d{3}|p7s)$'
+          } | ForEach-Object FullName
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing release asset: $asset" }
+          }
+          if ($assets.Count -lt 7) { throw "Expected manifest/signature, installer, runtime/app parts, and signatures before upload." }
+          gh release upload $tag @assets --clobber
+          if ($env:RELEASE_VERSION -match '-') {
+            $channelTag = "windows-beta"
+            gh release view $channelTag *> $null
+            if ($LASTEXITCODE -ne 0) {
+              gh release create $channelTag --prerelease --title "SPImaging Windows Beta Channel" --notes "Rolling signed beta manifest channel."
+            }
+            $channelIsPrerelease = gh release view $channelTag --json isPrerelease --jq .isPrerelease
+            if ($channelIsPrerelease -ne 'true') { throw "The windows-beta control release must remain a prerelease" }
+            gh release upload $channelTag `
+              "$env:OUT_DIR/spimaging-release-manifest.json" `
+              "$env:OUT_DIR/spimaging-release-manifest.json.p7s" `
+              --clobber
+          }
+
+  publish-unsigned-beta:
+    needs: [launcher-and-app, locked-runtimes, installer-preview]
+    if: inputs.publish_unsigned_beta && inputs.build_runtime && inputs.publish == false
+    runs-on: windows-latest
+    environment: windows-unsigned-beta-approval
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-app-launcher-${{ inputs.version }}
+          path: packaging/out
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-runtimes-${{ inputs.runtime_version }}
+          path: packaging/out
+      - uses: actions/download-artifact@v4
+        with:
+          name: SPImaging-Setup-unsigned-beta-${{ inputs.version }}
+          path: packaging/out
+      - name: Build an explicitly unsigned beta manifest
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_VERSION -notmatch '-') {
+            throw "Unsigned publication cannot target a stable SemVer"
+          }
+          if (Test-Path -LiteralPath "$env:OUT_DIR/SPImaging-Setup.exe") {
+            throw "Unsigned beta must never publish the stable installer filename"
+          }
+          packaging/scripts/New-ReleaseManifest.ps1 `
+            -Version $env:RELEASE_VERSION `
+            -RuntimeVersion $env:RUNTIME_VERSION `
+            -BaseUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$env:RELEASE_VERSION" `
+            -OutputDirectory $env:OUT_DIR
+      - name: Publish prerelease assets and advance only the beta manifest channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = "v$env:RELEASE_VERSION"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --verify-tag --prerelease --title "SPImaging $env:RELEASE_VERSION (unsigned beta)" --notes "Unsigned public beta. Windows may show a SmartScreen warning."
+          }
+          $isPrerelease = gh release view $tag --json isPrerelease --jq .isPrerelease
+          if ($isPrerelease -ne 'true') {
+            throw "Unsigned beta publication refuses a non-prerelease GitHub release"
+          }
+          $remoteAssetNames = @(gh release view $tag --json assets --jq '.assets[].name')
+          if ($remoteAssetNames -contains 'SPImaging-Setup.exe') {
+            throw "Unsigned beta publication refuses a release containing the stable installer filename"
+          }
+          $assets = @(
+            "$env:OUT_DIR/spimaging-release-manifest.json",
+            "$env:OUT_DIR/SPImaging-Setup-unsigned-beta.exe"
+          )
+          $assets += Get-ChildItem $env:OUT_DIR -File | Where-Object {
+            $_.Name -match '^spimaging-.*\.zip\.\d{3}$'
+          } | ForEach-Object FullName
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing unsigned beta asset: $asset" }
+          }
+          if ($assets.Count -lt 5) { throw "Expected manifest, unsigned installer, and app/CPU/CUDA parts." }
+          gh release upload $tag @assets --clobber
+
+          $channelTag = "windows-beta"
+          gh release view $channelTag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $channelTag --prerelease --title "SPImaging Windows Beta Channel" --notes "Rolling unsigned beta manifest channel; assets remain on immutable versioned prereleases."
+          }
+          $channelIsPrerelease = gh release view $channelTag --json isPrerelease --jq .isPrerelease
+          if ($channelIsPrerelease -ne 'true') { throw "The windows-beta control release must remain a prerelease" }
+          $channelAssets = @(gh release view $channelTag --json assets --jq '.assets[].name')
+          if ($channelAssets -contains 'spimaging-release-manifest.json.p7s') {
+            gh release delete-asset $channelTag 'spimaging-release-manifest.json.p7s' --yes
+          }
+          gh release upload $channelTag "$env:OUT_DIR/spimaging-release-manifest.json" --clobber

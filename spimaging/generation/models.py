@@ -29,14 +29,15 @@ def build_deepinverse_signal(depth, albedo, intensity, bins, bin_size, mean_sign
     return x
 
 
-def simulate_with_deepinverse(x_np, bins, irf_sigma):
+def simulate_with_deepinverse(x_np, bins, irf_sigma, device=None):
     import torch
 
     from spimaging.generation.deepinverse import import_deepinv
     from spimaging.training_common.device import get_torch_device
 
     dinv = import_deepinv()
-    device = get_torch_device()
+    if device is None:
+        device = get_torch_device()
     physics = dinv.physics.SinglePhotonLidar(bins=bins, sigma=irf_sigma, device=device)
 
     x = torch.from_numpy(x_np).unsqueeze(0).to(device)

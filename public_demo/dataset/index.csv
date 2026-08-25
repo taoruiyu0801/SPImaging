@@ -1,0 +1,5 @@
+sample_id,file,scene,source_mode,surface_model,height,width,temporal_bins,seed,mean_signal_photons,mean_background_photons,sbr,sha256
+0,sample_00000.npz,ramp_sphere,synthetic,single,64,64,1024,2026082301,16.0,4.0,4.0,ff08d79843a8ef79ebce181ecd333a682245fa4093f282dcd1f51d9694718a6c
+1,sample_00001.npz,steps_checker,synthetic,single,64,64,1024,2026082302,16.0,4.0,4.0,a2c22005fdfb5f38782bf68ca4a2870584a26ca2be5fb2d1870580ab4bd43a57
+2,sample_00002.npz,waves_rings,synthetic,single,64,64,1024,2026082303,16.0,4.0,4.0,e7b8d395613bf0ccf215a5bdb801bb71cc5cc80afa2e3a37f07c35d8854f01d7
+3,sample_00003.npz,pyramid_columns,synthetic,single,64,64,1024,2026082304,16.0,4.0,4.0,11d5bd96c6ea70815b6c6d73a059036b488e115c39078becad141eef0f63733b

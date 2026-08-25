@@ -1,0 +1,2 @@
+scripts/generate_synthetic_demo.py text eol=lf
+public_demo/dataset/index.csv text eol=lf

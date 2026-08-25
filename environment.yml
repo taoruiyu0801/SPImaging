@@ -7,10 +7,15 @@ dependencies:
   - numpy<2
   - scipy
   - h5py
+  # Keep the HDF5 runtime aligned with the current conda-forge h5py build.
+  - hdf5=2.1
   - imageio
   - scikit-image
   - matplotlib
+  - pyside6>=6.8,<7
+  - tk
   - tqdm
+  - pytest
   - pip:
       - opencv-python
       - -e .

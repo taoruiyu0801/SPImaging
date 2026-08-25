@@ -3,37 +3,90 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
+from collections.abc import Mapping
+import pickle
+import zipfile
+
+from spimaging.cli import (
+    ArgumentParser,
+    HelpFormatter,
+    add_device_arguments,
+    create_output_parent,
+    require_file,
+    validate_npz_archive,
+    validate_output_file,
+)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Predict depth from one generated SPAD .npz sample.")
-    parser.add_argument("--checkpoint", required=True, help="Path to best.pt or last.pt.")
-    parser.add_argument("--sample", required=True, help="Path to a generated sample_*.npz file.")
-    parser.add_argument("--output_npz", default="outputs/prediction.npz", help="Where to save predicted depth.")
-    parser.add_argument("--output_fig", default=None, help="Optional PNG path for visual comparison.")
-    return parser.parse_args()
+def build_parser():
+    parser = ArgumentParser(
+        prog="spad-predict",
+        description="Predict depth from one generated SPAD .npz sample.",
+        formatter_class=HelpFormatter,
+    )
+    parser.add_argument(
+        "--checkpoint",
+        required=True,
+        help="Path to a trained .pt or .pth checkpoint.",
+    )
+    parser.add_argument(
+        "--sample_file",
+        "--sample",
+        dest="sample_file",
+        required=True,
+        help="Path to one generated .npz sample; --sample is a compatibility alias.",
+    )
+    parser.add_argument(
+        "--output_npz",
+        default="outputs/prediction.npz",
+        help="Path for the compressed .npz prediction output.",
+    )
+    parser.add_argument(
+        "--output_fig",
+        default=None,
+        help="Optional path for a PNG, JPEG, PDF, or SVG comparison figure.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow existing output files to be replaced.",
+    )
+    add_device_arguments(parser)
+    return parser
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
 
 
 def load_model(checkpoint, device):
-    import torch
-
     from spimaging.training_common.networks import build_model, build_self_supervised_model, canonical_model_name
+    from spimaging.training_common.security import load_checkpoint_safely
 
-    ckpt = torch.load(checkpoint, map_location=device)
+    ckpt = load_checkpoint_safely(checkpoint, map_location=device)
     train_args = ckpt.get("args", {})
     method_family = ckpt.get("method_family", "supervised")
+    if method_family not in {"supervised", "self_supervised_spisr"}:
+        raise ValueError(f"unsupported checkpoint method_family: {method_family!r}")
     model_name = canonical_model_name(ckpt.get("model_name", train_args.get("model", "simple3d")))
     base_channels = int(train_args.get("base_channels", 8))
     num_blocks = int(train_args.get("num_blocks", 10))
+    if not 1 <= base_channels <= 256:
+        raise ValueError("checkpoint base_channels must be between 1 and 256")
+    if not 1 <= num_blocks <= 100:
+        raise ValueError("checkpoint num_blocks must be between 1 and 100")
     if method_family == "self_supervised_spisr":
+        time_scale = int(train_args.get("time_scale", 2))
+        spatial_scale = int(train_args.get("spatial_scale", 2))
+        if not 1 <= time_scale <= 64 or not 1 <= spatial_scale <= 64:
+            raise ValueError("checkpoint time/spatial scales must be between 1 and 64")
         model = build_self_supervised_model(
             model_name,
             in_channels=1,
             base_channels=base_channels,
             num_blocks=num_blocks,
-            time_scale=int(train_args.get("time_scale", 2)),
-            spatial_scale=int(train_args.get("spatial_scale", 2)),
+            time_scale=time_scale,
+            spatial_scale=spatial_scale,
         ).to(device)
     else:
         model = build_model(
@@ -69,34 +122,80 @@ def match_input_time_bins(logits, inputs):
 
 
 def main():
-    args = parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+
+    checkpoint = require_file(
+        parser,
+        args.checkpoint,
+        "--checkpoint",
+        suffixes=(".pt", ".pth"),
+    )
+    sample_file = require_file(
+        parser,
+        args.sample_file,
+        "--sample_file",
+        suffixes=(".npz",),
+    )
+    validate_npz_archive(parser, sample_file, "--sample_file", required_keys=("counts",))
+    output_npz = validate_output_file(
+        parser,
+        args.output_npz,
+        overwrite=args.overwrite,
+        option="--output_npz",
+        suffixes=(".npz",),
+    )
+    if output_npz.resolve() == sample_file.resolve():
+        parser.error("--output_npz must not overwrite --sample_file")
+    output_fig = None
+    if args.output_fig is not None:
+        output_fig = validate_output_file(
+            parser,
+            args.output_fig,
+            overwrite=args.overwrite,
+            option="--output_fig",
+            suffixes=(".png", ".jpg", ".jpeg", ".pdf", ".svg"),
+        )
+
     import numpy as np
     import torch
     import torch.nn.functional as F
 
     from spimaging.training_common.dataset import SPADHistogramDataset, SPISRSelfSupervisedDataset
     from spimaging.training_common.device import get_torch_device
-
-    device = get_torch_device()
-    model, train_args, method_family = load_model(args.checkpoint, device)
+    selection = get_torch_device(
+        mode=args.device,
+        gpu_index=args.gpu_index,
+        return_selection=True,
+    )
+    device = selection.device
+    try:
+        model, train_args, method_family = load_model(checkpoint, device)
+    except (EOFError, IndexError, KeyError, OSError, RuntimeError, ValueError, pickle.UnpicklingError) as exc:
+        parser.error(f"cannot load --checkpoint {checkpoint}: {exc}")
 
     temporal_downsample = int(train_args.get("temporal_downsample", 1))
     if method_family == "self_supervised_spisr":
         dataset = SPISRSelfSupervisedDataset(
-            [args.sample],
+            [sample_file],
             temporal_downsample=temporal_downsample,
             spatial_downsample=int(train_args.get("spatial_downsample", 1)),
             normalize=not bool(train_args.get("no_normalize", False)),
+            include_metadata=True,
         )
     else:
         dataset = SPADHistogramDataset(
-            [args.sample],
+            [sample_file],
             temporal_downsample=temporal_downsample,
             target_sigma_bins=float(train_args.get("target_sigma_bins", 2.0)),
             target_source=str(train_args.get("target_source", "depth")),
             use_log_counts=not bool(train_args.get("no_log_counts", False)),
+            require_depth=False,
         )
-    item = dataset[0]
+    try:
+        item = dataset[0]
+    except (EOFError, KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+        parser.error(f"cannot read --sample_file {sample_file}: {exc}")
     x_key = "measurement" if method_family == "self_supervised_spisr" else "input"
     x = item[x_key].unsqueeze(0).to(device)
 
@@ -111,12 +210,12 @@ def main():
         pred_depth_m = expected_depth_from_logits(logits, bin_size, effective_temporal_downsample)
 
     pred_depth_m = pred_depth_m.squeeze(0).cpu().numpy().astype(np.float32)
-    raw = np.load(args.sample, allow_pickle=True)
-    target_depth_m = raw["depth_m"].astype(np.float32) if "depth_m" in raw else None
+    target_depth_m = None
+    if "depth_m" in item:
+        target_depth_m = item["depth_m"].squeeze(0).cpu().numpy().astype(np.float32)
 
-    output_npz = Path(args.output_npz)
-    output_npz.parent.mkdir(parents=True, exist_ok=True)
-    save_dict = {"pred_depth_m": pred_depth_m, "sample": str(args.sample), "method_family": method_family}
+    create_output_parent(parser, output_npz, option="--output_npz")
+    save_dict = {"pred_depth_m": pred_depth_m, "sample": str(sample_file), "method_family": method_family}
     if method_family == "self_supervised_spisr":
         save_dict["pred_cube"] = logits.squeeze(0).squeeze(0).cpu().numpy().astype(np.float32)
     if target_depth_m is not None:
@@ -131,16 +230,18 @@ def main():
         save_dict["target_depth_m"] = target_depth_m
         save_dict["abs_error_m"] = np.abs(pred_depth_m - target_depth_m)
     np.savez_compressed(output_npz, **save_dict)
+    print(f"Device: {device}")
+    if selection.fallback:
+        print(f"Device selection: {selection.reason}")
     print(f"Saved prediction to: {output_npz}")
 
-    if args.output_fig is not None:
+    if output_fig is not None:
         import os
 
-        os.environ.setdefault("MPLCONFIGDIR", str((Path(args.output_fig).parent / ".matplotlib-cache").resolve()))
+        create_output_parent(parser, output_fig, option="--output_fig")
+        os.environ.setdefault("MPLCONFIGDIR", str((output_fig.parent / ".matplotlib-cache").resolve()))
         import matplotlib.pyplot as plt
 
-        output_fig = Path(args.output_fig)
-        output_fig.parent.mkdir(parents=True, exist_ok=True)
         ncols = 3 if target_depth_m is not None else 1
         fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 4))
         axes = np.atleast_1d(axes)

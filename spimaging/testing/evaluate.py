@@ -4,21 +4,121 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import os
 from pathlib import Path
+import pickle
+import zipfile
 
 import numpy as np
 
+from spimaging.appcore.storage import atomic_write_text
+from spimaging.cli import (
+    ArgumentParser,
+    HelpFormatter,
+    add_device_arguments,
+    create_output_directory,
+    nonnegative_int,
+    require_directory,
+    require_file,
+    validate_npz_archive,
+    validate_output_directory,
+)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate SPAD reconstruction checkpoints.")
-    parser.add_argument("--checkpoint", action="append", required=True, help="Checkpoint path. Can be passed multiple times.")
-    parser.add_argument("--label", action="append", default=None, help="Model label for each checkpoint.")
-    parser.add_argument("--dataset_dir", required=True, help="Directory containing sample_*.npz files.")
-    parser.add_argument("--output_dir", required=True, help="Directory for metrics and figures.")
-    parser.add_argument("--figure_index", type=int, default=0, help="Sample index used for the comparison figure.")
-    return parser.parse_args()
+
+_METRIC_FIELDS = ["model", "sample", "mae_m", "rmse_m", "abs_rel"]
+
+
+def _model_summary(metrics):
+    return {
+        "n_samples": len(metrics),
+        "mae_m": float(np.mean([item["mae_m"] for item in metrics])),
+        "rmse_m": float(np.mean([item["rmse_m"] for item in metrics])),
+        "abs_rel": float(np.mean([item["abs_rel"] for item in metrics])),
+    }
+
+
+def _persist_progress(output_dir, rows, summary, *, status, error=None):
+    """Atomically retain every completed evaluation result.
+
+    The regular CSV/summary paths always contain only fully computed rows.  A
+    separate progress record distinguishes partial/failed output from a
+    successful comparison so callers never need to infer completion from file
+    presence alone.
+    """
+
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=_METRIC_FIELDS, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    atomic_write_text(output_dir / "metrics_per_sample.csv", buffer.getvalue())
+    atomic_write_text(
+        output_dir / "metrics_summary.json",
+        json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+    )
+    progress = {
+        "schema_version": 1,
+        "status": status,
+        "completed_rows": len(rows),
+        "completed_models": sum(
+            1 for item in summary.values() if item.get("complete", False)
+        ),
+    }
+    if error:
+        progress["error"] = str(error)
+    atomic_write_text(
+        output_dir / "evaluation_progress.json",
+        json.dumps(progress, indent=2, ensure_ascii=False) + "\n",
+    )
+
+
+def build_parser():
+    parser = ArgumentParser(
+        prog="spad-evaluate",
+        description="Evaluate one or more SPAD reconstruction checkpoints.",
+        formatter_class=HelpFormatter,
+    )
+    parser.add_argument(
+        "--checkpoint",
+        action="append",
+        required=True,
+        help="Path to a trained .pt or .pth checkpoint; repeat for multiple models.",
+    )
+    parser.add_argument(
+        "--label",
+        action="append",
+        default=None,
+        help="Display label for a checkpoint; when used, repeat once per --checkpoint.",
+    )
+    parser.add_argument(
+        "--dataset_dir",
+        required=True,
+        help="Directory containing generated sample_*.npz files.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        required=True,
+        help="Directory for metric files and the comparison figure.",
+    )
+    parser.add_argument(
+        "--figure_index",
+        type=nonnegative_int,
+        default=0,
+        metavar="INDEX",
+        help="Zero-based sample index used for the comparison figure (must exist).",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow writing into an existing non-empty output directory.",
+    )
+    add_device_arguments(parser)
+    return parser
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
 
 
 def list_samples(dataset_dir: Path):
@@ -55,6 +155,7 @@ def predict_one(checkpoint, sample, device):
             temporal_downsample=temporal_downsample,
             spatial_downsample=int(train_args.get("spatial_downsample", 1)),
             normalize=not bool(train_args.get("no_normalize", False)),
+            include_metadata=True,
         )
         x_key = "measurement"
     else:
@@ -80,8 +181,9 @@ def predict_one(checkpoint, sample, device):
         pred = expected_depth_from_logits(logits, bin_size, effective_downsample)
 
     pred = pred.squeeze(0).cpu().numpy().astype(np.float32)
-    raw = np.load(sample, allow_pickle=True)
-    target = raw["depth_m"].astype(np.float32)
+    if "depth_m" not in item:
+        raise ValueError(f"evaluation sample has no depth_m target: {sample}")
+    target = item["depth_m"].squeeze(0).cpu().numpy().astype(np.float32)
     if pred.shape != target.shape:
         target_tensor = torch.from_numpy(target[None, None, ...]).float()
         target = (
@@ -122,62 +224,139 @@ def save_comparison_figure(output_path, sample_path, target, predictions):
 
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
+    temporary = output_path.with_name(
+        f".{output_path.stem}.{os.getpid()}.tmp{output_path.suffix}"
+    )
+    try:
+        plt.savefig(temporary, dpi=200, bbox_inches="tight")
+        os.replace(temporary, output_path)
+    finally:
+        plt.close(fig)
+        temporary.unlink(missing_ok=True)
 
 
 def main():
-    args = parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+
     labels = args.label or [Path(p).parent.name for p in args.checkpoint]
     if len(labels) != len(args.checkpoint):
-        raise ValueError("--label must be passed the same number of times as --checkpoint")
+        parser.error("--label must be passed the same number of times as --checkpoint")
 
-    import torch
+    dataset_dir = require_directory(parser, args.dataset_dir, "--dataset_dir")
+    checkpoints = [
+        require_file(
+            parser,
+            value,
+            "--checkpoint",
+            suffixes=(".pt", ".pth"),
+        )
+        for value in args.checkpoint
+    ]
+    try:
+        samples = list_samples(dataset_dir)
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
+    if args.figure_index >= len(samples):
+        parser.error(
+            f"--figure_index {args.figure_index} is out of range for "
+            f"{len(samples)} sample(s); expected 0 to {len(samples) - 1}"
+        )
+    for sample in samples:
+        validate_npz_archive(
+            parser,
+            sample,
+            "--dataset_dir sample",
+            required_keys=("counts", "depth_m"),
+        )
 
+    output_dir = validate_output_directory(
+        parser,
+        args.output_dir,
+        overwrite=args.overwrite,
+        option="--output_dir",
+    )
+    from spimaging.testing.predict import load_model
     from spimaging.training_common.device import get_torch_device
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    samples = list_samples(Path(args.dataset_dir))
-    device = get_torch_device()
-
+    selection = get_torch_device(
+        mode=args.device,
+        gpu_index=args.gpu_index,
+        return_selection=True,
+    )
+    device = selection.device
     rows = []
     summary = {}
     figure_predictions = []
     figure_target = None
-    figure_sample = samples[min(max(args.figure_index, 0), len(samples) - 1)]
+    figure_sample = samples[args.figure_index]
+    output_prepared = False
 
-    for label, checkpoint in zip(labels, args.checkpoint):
-        per_model = []
-        for sample in samples:
-            pred, target = predict_one(checkpoint, sample, device)
-            metrics = compute_metrics(pred, target)
-            row = {"model": label, "sample": sample.name, **metrics}
-            rows.append(row)
-            per_model.append(metrics)
-            if sample == figure_sample:
-                figure_predictions.append((label, pred))
-                figure_target = target
+    try:
+        for label, checkpoint in zip(labels, checkpoints):
+            try:
+                model, _, _ = load_model(checkpoint, device)
+            except (
+                EOFError,
+                IndexError,
+                KeyError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                pickle.UnpicklingError,
+            ) as exc:
+                raise ValueError(f"cannot load --checkpoint {checkpoint}: {exc}") from exc
+            del model
+            if not output_prepared:
+                create_output_directory(parser, output_dir, option="--output_dir")
+                _persist_progress(output_dir, rows, summary, status="running")
+                output_prepared = True
+            per_model = []
+            for sample in samples:
+                pred, target = predict_one(checkpoint, sample, device)
+                metrics = compute_metrics(pred, target)
+                row = {"model": label, "sample": sample.name, **metrics}
+                rows.append(row)
+                per_model.append(metrics)
+                summary[label] = {**_model_summary(per_model), "complete": False}
+                _persist_progress(output_dir, rows, summary, status="running")
+                if sample == figure_sample:
+                    figure_predictions.append((label, pred))
+                    figure_target = target
 
-        summary[label] = {
-            "n_samples": len(per_model),
-            "mae_m": float(np.mean([m["mae_m"] for m in per_model])),
-            "rmse_m": float(np.mean([m["rmse_m"] for m in per_model])),
-            "abs_rel": float(np.mean([m["abs_rel"] for m in per_model])),
-        }
-
-    with open(output_dir / "metrics_per_sample.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["model", "sample", "mae_m", "rmse_m", "abs_rel"])
-        writer.writeheader()
-        writer.writerows(rows)
-
-    with open(output_dir / "metrics_summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+            summary[label] = {**_model_summary(per_model), "complete": True}
+            _persist_progress(output_dir, rows, summary, status="running")
+    except (
+        EOFError,
+        IndexError,
+        KeyError,
+        MemoryError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        pickle.UnpicklingError,
+        zipfile.BadZipFile,
+    ) as exc:
+        if output_prepared:
+            _persist_progress(output_dir, rows, summary, status="failed", error=exc)
+        parser.error(f"cannot evaluate the supplied checkpoint or dataset: {exc}")
 
     if figure_target is not None:
-        save_comparison_figure(output_dir / "comparison.png", figure_sample, figure_target, figure_predictions)
+        try:
+            save_comparison_figure(
+                output_dir / "comparison.png",
+                figure_sample,
+                figure_target,
+                figure_predictions,
+            )
+        except (MemoryError, OSError, RuntimeError, ValueError) as exc:
+            _persist_progress(output_dir, rows, summary, status="failed", error=exc)
+            parser.error(f"cannot save evaluation comparison: {exc}")
+    _persist_progress(output_dir, rows, summary, status="complete")
 
     print(f"Device: {device}")
+    if selection.fallback:
+        print(f"Device selection: {selection.reason}")
     print(json.dumps(summary, indent=2))
     print(f"Saved metrics and figure to: {output_dir}")
 

@@ -1,0 +1,210 @@
+{
+  "checkpoint": {
+    "bytes": 10546,
+    "method_family": "supervised",
+    "model_name": "simple3d",
+    "path": "checkpoint/simple3d_synthetic.pt",
+    "recipe": {
+      "base_channels": 2,
+      "epochs": 8,
+      "final_kl": 0.6273979544639587,
+      "framework": "pytorch",
+      "initial_kl": 1.5778591632843018,
+      "learning_rate": 0.003,
+      "optimizer": "AdamW",
+      "optimizer_steps": 32,
+      "seed": 2026082301,
+      "target_sigma_bins": 0.75,
+      "temporal_downsample": 64,
+      "torch_version": "2.5.1",
+      "training_sample_sha256": [
+        "ff08d79843a8ef79ebce181ecd333a682245fa4093f282dcd1f51d9694718a6c",
+        "a2c22005fdfb5f38782bf68ca4a2870584a26ca2be5fb2d1870580ab4bd43a57",
+        "e7b8d395613bf0ccf215a5bdb801bb71cc5cc80afa2e3a37f07c35d8854f01d7",
+        "11d5bd96c6ea70815b6c6d73a059036b488e115c39078becad141eef0f63733b"
+      ],
+      "training_spatial_stride": 2
+    },
+    "sha256": "d48af9828f304fa20e2949bf199ea9ba128365d349d9f90fb115134916d1bb06",
+    "status": "generated"
+  },
+  "dataset": {
+    "index": {
+      "bytes": 732,
+      "path": "dataset/index.csv",
+      "sha256": "35d4bca6ccb88dd1a3f65929a96a79830d120f75ac629b6e747dc53f701377b4"
+    },
+    "path": "dataset",
+    "sample_count": 4,
+    "samples": [
+      {
+        "arrays": {
+          "counts": {
+            "dtype": "uint16",
+            "shape": [
+              1024,
+              64,
+              64
+            ]
+          },
+          "depth_m": {
+            "dtype": "float32",
+            "shape": [
+              64,
+              64
+            ]
+          },
+          "rgb": {
+            "dtype": "uint8",
+            "shape": [
+              64,
+              64,
+              3
+            ]
+          }
+        },
+        "bytes": 150352,
+        "path": "dataset/sample_00000.npz",
+        "sample_id": 0,
+        "scene": "ramp_sphere",
+        "seed": 2026082301,
+        "sha256": "ff08d79843a8ef79ebce181ecd333a682245fa4093f282dcd1f51d9694718a6c"
+      },
+      {
+        "arrays": {
+          "counts": {
+            "dtype": "uint16",
+            "shape": [
+              1024,
+              64,
+              64
+            ]
+          },
+          "depth_m": {
+            "dtype": "float32",
+            "shape": [
+              64,
+              64
+            ]
+          },
+          "rgb": {
+            "dtype": "uint8",
+            "shape": [
+              64,
+              64,
+              3
+            ]
+          }
+        },
+        "bytes": 70549,
+        "path": "dataset/sample_00001.npz",
+        "sample_id": 1,
+        "scene": "steps_checker",
+        "seed": 2026082302,
+        "sha256": "a2c22005fdfb5f38782bf68ca4a2870584a26ca2be5fb2d1870580ab4bd43a57"
+      },
+      {
+        "arrays": {
+          "counts": {
+            "dtype": "uint16",
+            "shape": [
+              1024,
+              64,
+              64
+            ]
+          },
+          "depth_m": {
+            "dtype": "float32",
+            "shape": [
+              64,
+              64
+            ]
+          },
+          "rgb": {
+            "dtype": "uint8",
+            "shape": [
+              64,
+              64,
+              3
+            ]
+          }
+        },
+        "bytes": 162726,
+        "path": "dataset/sample_00002.npz",
+        "sample_id": 2,
+        "scene": "waves_rings",
+        "seed": 2026082303,
+        "sha256": "e7b8d395613bf0ccf215a5bdb801bb71cc5cc80afa2e3a37f07c35d8854f01d7"
+      },
+      {
+        "arrays": {
+          "counts": {
+            "dtype": "uint16",
+            "shape": [
+              1024,
+              64,
+              64
+            ]
+          },
+          "depth_m": {
+            "dtype": "float32",
+            "shape": [
+              64,
+              64
+            ]
+          },
+          "rgb": {
+            "dtype": "uint8",
+            "shape": [
+              64,
+              64,
+              3
+            ]
+          }
+        },
+        "bytes": 81108,
+        "path": "dataset/sample_00003.npz",
+        "sample_id": 3,
+        "scene": "pyramid_columns",
+        "seed": 2026082304,
+        "sha256": "11d5bd96c6ea70815b6c6d73a059036b488e115c39078becad141eef0f63733b"
+      }
+    ]
+  },
+  "generator": {
+    "command": "python scripts/generate_synthetic_demo.py --force",
+    "name": "SPImaging analytic synthetic demo generator",
+    "numpy": "1.26.4",
+    "path": "scripts/generate_synthetic_demo.py",
+    "python": "3.10.21",
+    "sha256": "d87ede09c253bb560a9bbd1361d94d0b634c813d6e07fae70544c9c940d70ab0",
+    "version": "1.0.0"
+  },
+  "parameters": {
+    "base_seed": 2026082301,
+    "bin_size_seconds": 8e-11,
+    "mean_background_photons": 4.0,
+    "mean_signal_photons": 16.0,
+    "poisson_generator": "numpy.random.Generator(PCG64)",
+    "pulse_sigma_bins": 2.0,
+    "spatial_shape": [
+      64,
+      64
+    ],
+    "temporal_bins": 1024
+  },
+  "provenance": {
+    "asset_license": "CC0-1.0",
+    "description": "RGB, metric depth and SPAD counts are constructed from analytic geometry and fixed pseudo-random seeds in the generator source.",
+    "external_image_data": false,
+    "external_source_files": [],
+    "license_notice": "CC0_NOTICE.md",
+    "source_kind": "analytic_procedural_geometry"
+  },
+  "release": "0.2.0-beta.1",
+  "reproducibility": {
+    "checkpoint": "Deterministic CPU recipe; exact bytes are guaranteed for the locked release Python/NumPy/PyTorch runtime recorded by the release build.",
+    "sample_archives": "Byte-stable through sorted NPY members, fixed ZIP metadata, explicit dtypes and fixed PCG64 seeds."
+  },
+  "schema_version": 1
+}

@@ -1,9 +1,23 @@
 import argparse
 from pathlib import Path
+import pickle
 import random
 import textwrap
+import zipfile
 
 import numpy as np
+
+from spimaging.cli import (
+    ArgumentParser,
+    HelpFormatter,
+    create_output_parent,
+    nonnegative_int,
+    positive_int,
+    require_directory,
+    validate_npz_archive,
+    validate_output_directory,
+    validate_output_file,
+)
 
 try:
     import cv2
@@ -11,22 +25,65 @@ except ModuleNotFoundError:
     cv2 = None
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Interactive SPAD dataset browser using OpenCV only."
+def build_parser():
+    parser = ArgumentParser(
+        prog="spad-browse",
+        description="Interactively browse generated SPAD samples with OpenCV.",
+        formatter_class=HelpFormatter,
     )
-    parser.add_argument("--dataset_dir", type=str, required=True, help="Directory containing generated .npz samples.")
-    parser.add_argument("--start_index", type=int, default=0, help="Initial sample index.")
-    parser.add_argument("--random_start", action="store_true", help="Start from a random sample.")
-    parser.add_argument("--window_name", type=str, default="SPAD Dataset Browser", help="OpenCV window name.")
-    parser.add_argument("--cell_size", type=int, default=320, help="Each panel will be resized to cell_size x cell_size.")
-    parser.add_argument("--save_dir", type=str, default=None, help="Directory for saving current canvas when pressing 'g'.")
+    parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        required=True,
+        help="Directory containing generated .npz samples.",
+    )
+    parser.add_argument(
+        "--start_index",
+        type=nonnegative_int,
+        default=0,
+        metavar="INDEX",
+        help="Zero-based initial sample index (must exist).",
+    )
+    parser.add_argument(
+        "--random_start",
+        action="store_true",
+        help="Start from a random sample instead of --start_index.",
+    )
+    parser.add_argument(
+        "--window_name",
+        type=str,
+        default="SPAD Dataset Browser",
+        help="OpenCV window name.",
+    )
+    parser.add_argument(
+        "--cell_size",
+        type=positive_int,
+        default=320,
+        metavar="PIXELS",
+        help="Width and height in pixels of each image panel.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        "--save_dir",
+        dest="output_dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory for canvases saved with the G key; by default uses "
+            "<dataset_dir>/browse_exports. --save_dir is a compatibility alias."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow a previously saved canvas file to be replaced.",
+    )
     parser.add_argument(
         "--browse_mode",
         type=str,
         default="auto",
         choices=["auto", "single", "neighborhood_mix", "translucent_layer", "volume_scattering"],
-        help="Display mode. 'auto' reads surface_model from the sample when available.",
+        help="Display mode; auto reads surface_model from each sample when available.",
     )
     parser.add_argument(
         "--pixel_source",
@@ -35,7 +92,11 @@ def parse_args():
         choices=["auto", "counts", "transient_clean"],
         help="Source used for the three per-pixel histograms.",
     )
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
 
 
 def list_npz_files(dataset_dir: Path):
@@ -490,7 +551,18 @@ def assemble_canvas(items, hist, pixel_hists, pixel_points, hist_source_name, me
 
 
 class SPADBrowser:
-    def __init__(self, files, start_index=0, save_dir=None, window_name="SPAD Dataset Browser", cell_size=320, browse_mode="auto", pixel_source="auto"):
+    def __init__(
+        self,
+        files,
+        start_index=0,
+        save_dir=None,
+        window_name="SPAD Dataset Browser",
+        cell_size=320,
+        browse_mode="auto",
+        pixel_source="auto",
+        overwrite=False,
+        parser=None,
+    ):
         self.files = files
         self.index = max(0, min(start_index, len(files) - 1))
         self.save_dir = Path(save_dir) if save_dir is not None else None
@@ -498,10 +570,26 @@ class SPADBrowser:
         self.cell_size = cell_size
         self.browse_mode = browse_mode
         self.pixel_source = pixel_source
+        self.overwrite = overwrite
+        self.parser = parser
 
     def load_current(self):
         path = self.files[self.index]
-        data = np.load(path, allow_pickle=True)
+        try:
+            from spimaging.training_common.security import load_spad_sample
+
+            data = load_spad_sample(path)
+        except (
+            EOFError,
+            OSError,
+            TypeError,
+            ValueError,
+            pickle.UnpicklingError,
+            zipfile.BadZipFile,
+        ) as exc:
+            if self.parser is not None:
+                self.parser.error(f"cannot read sample {path}: {exc}")
+            raise ValueError(f"Cannot read sample {path}: {exc}") from exc
         return path, data
 
     def print_info(self):
@@ -510,7 +598,7 @@ class SPADBrowser:
         print(f"Sample file: {path.name}")
         print(f"Full path   : {path}")
         print("-" * 80)
-        for key in data.files:
+        for key in data:
             arr = data[key]
             if isinstance(arr, np.ndarray):
                 if arr.ndim == 0:
@@ -523,9 +611,26 @@ class SPADBrowser:
 
     def save_canvas(self, canvas):
         out_dir = self.files[self.index].parent / "browse_exports" if self.save_dir is None else self.save_dir
-        out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{self.files[self.index].stem}_browse.png"
-        cv2.imwrite(str(out_path), canvas)
+        if self.parser is not None:
+            out_path = validate_output_file(
+                self.parser,
+                str(out_path),
+                overwrite=self.overwrite,
+                option="saved canvas",
+                suffixes=(".png",),
+            )
+            create_output_parent(self.parser, out_path, option="saved canvas")
+        else:
+            if out_path.exists() and not self.overwrite:
+                raise FileExistsError(
+                    f"Saved canvas already exists: {out_path}; enable overwrite to replace it"
+                )
+            out_dir.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(out_path), canvas):
+            if self.parser is not None:
+                self.parser.error(f"failed to save canvas: {out_path}")
+            raise OSError(f"Failed to save canvas: {out_path}")
         print(f"Saved figure to: {out_path}")
 
     def build_canvas(self):
@@ -582,26 +687,49 @@ class SPADBrowser:
 
 
 def main():
-    args = parse_args()
-    require_cv2()
-    dataset_dir = Path(args.dataset_dir)
-    if not dataset_dir.exists():
-        raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
+    parser = build_parser()
+    args = parser.parse_args()
+    dataset_dir = require_directory(parser, args.dataset_dir, "--dataset_dir")
 
     files = list_npz_files(dataset_dir)
-    if len(files) == 0:
-        raise FileNotFoundError("No .npz files found in the specified dataset directory.")
+    if not files:
+        parser.error(f"--dataset_dir contains no .npz samples: {dataset_dir}")
+    for sample_path in files:
+        validate_npz_archive(parser, sample_path, "dataset sample")
+    if not args.random_start and args.start_index >= len(files):
+        parser.error(
+            f"--start_index {args.start_index} is out of range for {len(files)} sample(s); "
+            f"expected 0 to {len(files) - 1}"
+        )
+
+    output_dir = None
+    if args.output_dir is not None:
+        output_dir = validate_output_directory(
+            parser,
+            args.output_dir,
+            overwrite=args.overwrite,
+            option="--output_dir",
+            require_empty=False,
+        )
+
+    if cv2 is None:
+        parser.error(
+            "OpenCV is required for the dataset browser; install it with "
+            "'pip install opencv-python'"
+        )
 
     start_index = random.randrange(len(files)) if args.random_start else args.start_index
 
     browser = SPADBrowser(
         files=files,
         start_index=start_index,
-        save_dir=args.save_dir,
+        save_dir=output_dir,
         window_name=args.window_name,
         cell_size=args.cell_size,
         browse_mode=args.browse_mode,
         pixel_source=args.pixel_source,
+        overwrite=args.overwrite,
+        parser=parser,
     )
     browser.run()
 

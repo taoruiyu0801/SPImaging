@@ -11,42 +11,23 @@
 - 支持自监督 SPISR 训练：使用 PUKL 与 equivariance 约束，不需要 HR 标签。
 - 支持 checkpoint 推理，输出预测深度图和可选对比图。
 
-## 环境安装
+## 源码环境安装
 
-推荐使用 Conda 环境：
+Windows 桌面版要求 NVIDIA 显卡和可用的 NVIDIA 驱动，但不要求预先安装完整 CUDA Toolkit。建议先到 [PyTorch Get Started](https://pytorch.org/get-started/locally/) 按显卡驱动选择官方 CUDA wheel，然后在独立虚拟环境中安装源码：
 
-```bash
-conda env create -f environment.yml
-conda activate spimaging
-python -m pip install --upgrade --force-reinstall \
-  "torch==2.11.0+cu130" \
-  "torchvision==0.26.0+cu130" \
-  "torchaudio==2.11.0+cu130" \
-  --index-url https://download.pytorch.org/whl/cu130 \
-  --extra-index-url https://pypi.org/simple
-python -m pip install --force-reinstall "numpy<2"
-python -m pip install deepinv
+```powershell
+py -3.10 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+# 先执行 PyTorch 官网为本机给出的 CUDA 安装命令
+python -m pip install -e ".[training,desktop]"
 ```
 
-如果环境已经存在，只需要激活并确认 CUDA 版 PyTorch：
+如果只需要生成、检查和浏览数据，可安装基础依赖：
 
-```bash
-conda activate spimaging
-python -m pip install --upgrade --force-reinstall \
-  "torch==2.11.0+cu130" \
-  "torchvision==0.26.0+cu130" \
-  "torchaudio==2.11.0+cu130" \
-  --index-url https://download.pytorch.org/whl/cu130 \
-  --extra-index-url https://pypi.org/simple
-python -m pip install --force-reinstall "numpy<2"
-python -m pip install deepinv
-```
-
-也可以用 pip 安装基础依赖：
-
-```bash
-pip install -r requirements.txt
-pip install -e .
+```powershell
+python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
 说明：
@@ -55,15 +36,15 @@ pip install -e .
 - `torch` 和 `deepinv` 对 `--surface_model single`、训练与推理是必需的。
 - `neighborhood_mix`、`translucent_layer`、`volume_scattering` 使用项目内 NumPy 实现。
 - `spad-browse` 需要可用的本机 OpenCV 图形窗口环境。
-- 训练、推理和 `single` 生成会自动选择计算设备：如果当前 PyTorch 可用 CUDA GPU，则优先使用 GPU；否则回退到 CPU。
-- 本机已验证的 GPU 配置为 `torch 2.11.0+cu130` / `torchvision 0.26.0+cu130` / `torchaudio 2.11.0+cu130`，驱动显示 CUDA 13.1，PyTorch 运行时显示 CUDA 13.0。
-- 如果机器有 NVIDIA GPU 但 `torch.cuda.is_available()` 为 `False`，说明当前环境安装的是 CPU 版 PyTorch，按上面的 CUDA PyTorch 命令重装即可。
-- 官方安装命令可按机器情况从 PyTorch Get Started 页面选择：<https://docs.pytorch.org/get-started/locally/>。
+- 正式 Windows GUI 强制使用 CUDA；真实 CUDA 张量和 3D 卷积自检失败时不会启动训练任务，也不会静默回退 CPU。
+- 源码模式仍允许开发者显式使用 CPU 跑轻量测试和部分 CLI，但不属于安装版支持路径。
+- 不要把某个固定 CUDA wheel 用到所有电脑。PyTorch wheel 自带所需 CUDA 用户态运行库，关键是 NVIDIA 驱动满足所选 wheel 的最低要求。
+- 如果机器有 NVIDIA GPU 但 `torch.cuda.is_available()` 为 `False`，通常是装成了 CPU 版 PyTorch或驱动不兼容，请按 PyTorch 官网选择器重装。
 
 验证 CUDA 是否可用：
 
 ```bash
-python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+python -c "import torch; assert torch.cuda.is_available(); x=torch.ones(1, device='cuda'); print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0), x.item())"
 ```
 
 安装后可以检查命令行入口：
@@ -76,7 +57,19 @@ spad-train --help
 spad-train-selfsup --help
 spad-predict --help
 spad-evaluate --help
+spad-demo --help
 ```
+
+这些命令安装在当前 Python 虚拟环境中。如果 PowerShell 提示命令不存在，先确认已经执行 `.\.venv\Scripts\Activate.ps1`；也可直接使用 `.\.venv\Scripts\python.exe -m spimaging.demo`。
+
+### 命令行参数与路径规则
+
+- 参数名称统一使用下划线风格。`spad-predict` 使用 `--sample_file`，`spad-verify` 使用 `--sample_name` 和 `--output_fig`，`spad-browse` 使用 `--output_dir`。
+- 旧参数 `--sample`、`--save_fig`、`--save_dir` 暂时保留为兼容别名；新脚本应使用上述规范名称。
+- 输入文件和输入目录必须已经存在，程序不会为输入路径创建空目录；错误输入会给出明确提示、无 Python traceback，并以状态码 2 退出。
+- 输出目录以及输出文件的父目录会在全部输入校验通过后自动创建。相对路径以当前工作目录为基准。
+- 已有输出默认不会被覆盖；确认需要替换同名结果或写入非空输出目录时，显式传入 `--overwrite`。
+- 各入口的默认值、合法范围和路径行为见 [`参数说明表.md`](record_of_SPI/Day_13-14/参数说明表.md) 或 [`参数说明表.csv`](record_of_SPI/Day_13-14/参数说明表.csv)。
 
 ## 项目结构
 
@@ -87,11 +80,19 @@ spad-evaluate --help
 ├── environment.yml                 # Conda 环境配置
 ├── requirements.txt                # pip 依赖列表
 ├── spimaging/
+│   ├── demo.py                     # 无界面的一键检查、训练、预测和评估入口
+│   ├── gui.py                      # 一键演示的 Tkinter 桌面界面
 │   ├── generation/                 # 数据生成：数据读取、预处理、SPAD 测量模型、spad-generate
 │   ├── supervised_training/        # 有监督深度重建训练入口，对应 spad-train
 │   ├── self_supervised_training/   # 自监督 SPISR 训练入口，对应 spad-train-selfsup
 │   ├── testing/                    # 检查、浏览与 checkpoint 推理，对应 spad-verify/browse/predict
+│   ├── cli.py                      # 共享 CLI 数值、路径与输出校验
 │   └── training_common/            # 训练共享的 Dataset、loss、network、checkpoint 工具
+├── tests/                          # CLI 参数、错误提示和无副作用回归测试
+├── launcher/                        # Windows 轻量启动器与 CUDA 计算引擎检测/安装
+├── public_demo/                     # 4 个 CC0 合成样本和 Simple3D checkpoint
+├── packaging/                       # PyInstaller、Inno Setup 与发布脚本
+├── record_of_SPI/Day_13-14/        # Markdown/CSV 参数表
 ├── example_data/                   # 仓库内置的少量可运行样例数据
 ├── middlebury/
 │   ├── raw/                        # Middlebury 原始数据，需自行准备
@@ -114,13 +115,15 @@ example_data/nyuv2_raw_single_random_snr/
 
 这 4 个样本来自 NYUv2 raw 数据，经本项目 `single` 单表面模型生成，空间分辨率为 `64x64`，时间维为 `1024` bins，`param_idx=10`，即信号光子数与 SBR 随机采样。它们适合快速验证安装、可视化、Dataset 读取、训练 smoke test 和评估脚本，不适合作为正式训练集。
 
+这套已跟踪的 `example_data` 同时作为项目的 demo data，不另建一份内容重复的 `demo_data`。数据说明见 [`example_data/README.md`](example_data/README.md)。
+
 快速检查内置样例：
 
 ```bash
 spad-verify \
   --dataset_dir example_data/nyuv2_raw_single_random_snr \
   --index 0 \
-  --save_fig outputs/example_verify_sample_00000.png
+  --output_fig outputs/example_verify_sample_00000.png
 ```
 
 用内置样例跑一个最小监督训练：
@@ -138,6 +141,90 @@ spad-train \
   --val_fraction 0.25 \
   --num_workers 0
 ```
+
+### 一键稳定演示
+
+安装训练依赖后，可以用一个无界面入口串行完成“检查样例—最小训练—预测—评估”：
+
+```bash
+spad-demo
+```
+
+默认读取 `example_data/nyuv2_raw_single_random_snr`，输出到 `outputs/demo`。也可以指定其他包含至少两个有效样本的数据集：
+
+```bash
+spad-demo \
+  --dataset_dir example_data/nyuv2_raw_single_random_snr \
+  --output_dir outputs/demo
+```
+
+演示固定使用轻量配置训练 1 个 epoch，并在独立子进程中执行四个现有入口。Matplotlib 使用无界面后端，因此不会打开窗口或抢占桌面焦点。输出包括：
+
+```text
+outputs/demo/
+├── verify/sample_00000.png
+├── train/last.pt
+├── train/best.pt
+├── predict/prediction.npz
+├── predict/comparison.png
+├── evaluate/metrics_per_sample.csv
+├── evaluate/metrics_summary.json
+├── evaluate/comparison.png
+├── demo.log
+└── demo_summary.json
+```
+
+已有非空输出目录默认拒绝写入。需要重跑时使用 `--overwrite`；该参数只替换 demo 管理的产物，输出目录中的无关文件会保留。四个阶段全部成功并通过产物校验后，临时 staging 结果才会发布到正式目录；失败时不会留下半成品正式输出。
+
+### GUI 一键演示
+
+使用 `environment.yml` 创建或更新环境后，可以启动轻量桌面界面：
+
+```powershell
+python -m spimaging.gui
+```
+
+在窗口中选择数据集目录和输出目录，点击“开始演示”即可运行同一套“检查样例—最小训练—预测—评估”流程。窗口会实时显示四个阶段的进度与完整日志；成功后会读取 `demo_summary.json`，显示总耗时、样本数和 MAE、RMSE、AbsRel 指标，并可直接打开输出目录。
+
+GUI 不复制训练或推理代码，而是在后台调用现有 `spimaging.demo` 模块，因此命令行和桌面版本使用相同的输入校验、临时目录发布和失败清理机制。运行过程中窗口会阻止直接关闭，以免留下孤立的训练进程。这个 Tkinter 入口继续保留，适合作为旧版轻量演示；完整 Windows 工作台见下一节。
+
+### PySide6 Windows 实验工作台（0.2.0-beta.1）
+
+Windows 10/11 x64 公开测试版提供中文 PySide6 工作台，源码环境可直接启动：
+
+```powershell
+python -m spimaging.desktop
+```
+
+工作台包含首页、实验配置、运行监控、结果画廊、历史恢复和设置六个页面。仿真模型与重建模型分开选择，参数表单由共享算法注册表生成；训练 worker 在独立进程中运行，按批次和 epoch 输出结构化进度，支持安全取消和兼容 checkpoint 恢复。每次实验都有独立运行目录，保存 `run.json`、`events.jsonl`、日志、checkpoint、指标、画廊和 `result_manifest.json`。
+
+Windows 安装候选通过 `packaging/scripts/Build-Installer.ps1` 生成。安装器按当前用户写入 `%LOCALAPPDATA%\Programs\SPImaging`，不修改 `PATH`，也不要求管理员权限。基础安装包只包含轻量 `SPImaging.exe`、应用源码、公开合成样例和 `uv`，不内置 Conda、PyTorch 或 CUDA Toolkit。
+
+首次启动会检测 NVIDIA 显卡、驱动和现有 Python 环境，并以真实 CUDA 张量与 3D 卷积验证可用性。通过时直接复用；找不到兼容环境时，用户可确认由 `uv` 创建软件私有的 Python 环境，并下载与显卡/驱动匹配的 CUDA 版 PyTorch。启动器不会安装或修改显卡驱动，CUDA 自检失败时也不会回退 CPU。
+
+注意：仓库里的本机构建产物是 `unsigned beta`。Windows SmartScreen 可能显示未知发布者提示；取得 Authenticode 证书并完成签名发布前，不应把它称为正式签名版。首次创建 CUDA 计算环境需要联网并预留至少 8 GiB 空间；环境就绪后可以离线启动。详细构建说明见 [`packaging/README.md`](packaging/README.md)。
+
+公开安装包只包含 `public_demo/` 下的 4 个确定性 CC0 合成样本和配套 Simple3D checkpoint，不包含 `example_data/` 中的 NYUv2 衍生资产。软件不会自动下载 NYUv2/Middlebury 原始数据，也不会上传用户数据。
+
+### 使用预训练 checkpoint 快速演示
+
+如果只需要演示“加载已有模型—预测—评估”，可以使用公开合成样例和配套的轻量 checkpoint：
+
+```powershell
+spad-predict `
+    --checkpoint public_demo/checkpoint/simple3d_synthetic.pt `
+    --sample_file public_demo/dataset/sample_00000.npz `
+    --output_npz outputs/public_quick_demo/predict/prediction.npz `
+    --output_fig outputs/public_quick_demo/predict/comparison.png
+
+spad-evaluate `
+    --checkpoint public_demo/checkpoint/simple3d_synthetic.pt `
+    --label public-simple3d `
+    --dataset_dir public_demo/dataset `
+    --output_dir outputs/public_quick_demo/evaluate
+```
+
+checkpoint 约 10 KiB，4 个合成 NPZ 合计约 455 KiB。训练与评估使用同一小型样本集合，指标只用于 smoke demo，不代表独立测试集精度。完整哈希、生成参数和训练配方见 [`public_demo/manifest.json`](public_demo/manifest.json)。
 
 完整数据集不随仓库上传，请按需要从官方来源下载：
 
@@ -239,12 +326,12 @@ spad-generate \
 spad-verify \
   --dataset_dir outputs/pipeline_nyuv2_raw_single_random_snr/data \
   --index 0 \
-  --save_fig outputs/pipeline_nyuv2_raw_single_random_snr/verify_sample_00000.png
+  --output_fig outputs/pipeline_nyuv2_raw_single_random_snr/verify_sample_00000.png
 
 spad-verify \
   --dataset_dir outputs/pipeline_nyuv2_raw_single_random_snr/data \
   --index 40 \
-  --save_fig outputs/pipeline_nyuv2_raw_single_random_snr/verify_sample_00040.png
+  --output_fig outputs/pipeline_nyuv2_raw_single_random_snr/verify_sample_00040.png
 ```
 
 也可以用交互浏览器逐个检查异常样本：
@@ -312,7 +399,7 @@ spad-browse \
 spad-verify \
   --dataset_dir middlebury/processed_test \
   --index 0 \
-  --save_fig outputs/verify_sample_00000.png
+  --output_fig outputs/verify_sample_00000.png
 ```
 
 交互式浏览器：
@@ -567,7 +654,7 @@ spad-train-selfsup \
 ```bash
 spad-predict \
   --checkpoint outputs/train_simple3d/best.pt \
-  --sample middlebury/processed_test/sample_00000.npz \
+  --sample_file middlebury/processed_test/sample_00000.npz \
   --output_npz outputs/prediction/simple3d_sample_00000.npz \
   --output_fig outputs/prediction/simple3d_sample_00000.png
 ```
@@ -577,7 +664,7 @@ spad-predict \
 ```bash
 spad-predict \
   --checkpoint outputs/train_spisr_selfsup/best.pt \
-  --sample middlebury/processed_test/sample_00000.npz \
+  --sample_file middlebury/processed_test/sample_00000.npz \
   --output_npz outputs/prediction/spisr_sample_00000.npz \
   --output_fig outputs/prediction/spisr_sample_00000.png
 ```
@@ -676,6 +763,30 @@ spad-evaluate \
 | 修改监督训练循环 | `spimaging/supervised_training/train.py` |
 | 修改自监督训练循环 | `spimaging/self_supervised_training/train.py` |
 | 修改推理输出 | `spimaging/testing/predict.py` |
+
+### 运行自动化测试
+
+开发环境安装 pytest 后，完整测试会覆盖四类数据生成、五类重建模型、CUDA 强制策略、checkpoint、预测和批量评估：
+
+```powershell
+python -m pytest -q
+```
+
+测试输出使用 pytest 的临时目录，不会写入项目的正式 `outputs/`。如果只想先做快速检查，可运行：
+
+```powershell
+python -m pytest -q tests/test_smoke.py tests/test_error_inputs_pytest.py
+```
+
+### 第二台电脑独立验收
+
+将完整项目压缩包发送给测试者。测试者解压后，在项目根目录运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/run_day27_validation.ps1
+```
+
+该旧验收脚本会建立临时 Conda 环境，适合复现早期 CLI 验收，不代表当前 Windows 安装版架构。安装版应直接运行 `SPImaging-Setup-unsigned-beta.exe`，确认 NVIDIA/CUDA 自检、计算引擎复用或安装、结果画廊和离线重启。
 
 ## 常见问题
 
