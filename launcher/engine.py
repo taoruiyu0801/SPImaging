@@ -28,7 +28,7 @@ from .errors import LauncherError
 
 
 ENGINE_SCHEMA_VERSION = 1
-ENGINE_PYTHON_VERSION = "3.12"
+ENGINE_PYTHON_VERSION = "3.12.13"
 MINIMUM_FREE_BYTES = 8 * 1024**3
 MINIMUM_CPU_FREE_BYTES = 4 * 1024**3
 REQUIRED_MODULES = (
@@ -239,6 +239,86 @@ def _probe_environment(app_root: Path) -> dict[str, str]:
     return environment
 
 
+def _install_environment(
+    executable: str | Path,
+    environment_overrides: dict[str, str],
+) -> dict[str, str]:
+    """Build an installer environment isolated from the host Python stack.
+
+    Desktop hosts may prepend short-lived Conda, venv, Codex or Hermes paths to
+    ``PATH``.  Letting ``uv`` inspect those paths can fail before it reaches the
+    managed interpreter, and can also make a supposedly private engine depend
+    on software that disappears when the host application exits.
+    """
+
+    environment = os.environ.copy()
+    conda_roots = tuple(
+        Path(value).expanduser().resolve()
+        for key, value in environment.items()
+        if key.upper() in {"CONDA_PREFIX", "CONDA_ROOT", "CONDA_EXE"} and value
+    )
+    for key in tuple(environment):
+        upper = key.upper()
+        if upper.startswith(("CONDA_", "UV_")) or upper in {
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PYTHONUSERBASE",
+            "VIRTUAL_ENV",
+            "_CE_CONDA",
+            "_CE_M",
+        }:
+            environment.pop(key, None)
+
+    for key in tuple(environment):
+        if key.upper() not in {"SSL_CERT_DIR", "SSL_CERT_FILE"}:
+            continue
+        value = environment.get(key, "")
+        try:
+            certificate_path = Path(value).expanduser().resolve()
+        except (OSError, RuntimeError):
+            continue
+        if any(certificate_path.is_relative_to(root) for root in conda_roots):
+            environment.pop(key, None)
+
+    path_entries = [Path(executable).resolve().parent]
+    if os.name == "nt":
+        windows_root = Path(environment.get("SystemRoot") or environment.get("WINDIR") or r"C:\Windows")
+        path_entries.extend(
+            (
+                windows_root / "System32",
+                windows_root,
+                windows_root / "System32" / "Wbem",
+                windows_root / "System32" / "WindowsPowerShell" / "v1.0",
+            )
+        )
+    else:
+        path_entries.extend(Path(item) for item in os.defpath.split(os.pathsep) if item)
+
+    clean_path: list[str] = []
+    seen: set[str] = set()
+    for entry in path_entries:
+        shown = str(entry)
+        key = os.path.normcase(os.path.normpath(shown))
+        if key not in seen:
+            clean_path.append(shown)
+            seen.add(key)
+
+    environment["PATH"] = os.pathsep.join(clean_path)
+    environment.update(
+        {
+            "PYTHONUTF8": "1",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONSAFEPATH": "1",
+            "UV_NO_PROGRESS": "1",
+            "UV_LINK_MODE": "copy",
+            "UV_MANAGED_PYTHON": "1",
+            "UV_NO_CONFIG": "1",
+        }
+    )
+    environment.update(environment_overrides)
+    return environment
+
+
 _PROBE_PROGRAM = r'''
 import importlib.util, json, platform, sys
 result = {"python_version": sys.version.split()[0]}
@@ -350,7 +430,9 @@ def probe_engine(
         return EngineProbe(
             str(executable),
             True,
-            "真实 CUDA 张量与 3D 卷积自检通过",
+            "真实 CUDA 张量与 3D 卷积自检通过"
+            if variant == "cuda"
+            else "CPU 张量与 3D 卷积自检通过",
             str(payload.get("python_version", "")),
             str(payload.get("torch_version", "")),
             str(payload.get("cuda_version", "")),
@@ -593,11 +675,7 @@ class EngineManager:
         activity_roots: Sequence[Path],
         environment_overrides: dict[str, str],
     ) -> None:
-        environment = os.environ.copy()
-        environment["PYTHONUTF8"] = "1"
-        environment["UV_NO_PROGRESS"] = "1"
-        environment["UV_LINK_MODE"] = "copy"
-        environment.update(environment_overrides)
+        environment = _install_environment(command[0], environment_overrides)
         _emit(progress, stage, step, total_steps, start_percent, label)
         try:
             process = subprocess.Popen(
@@ -729,8 +807,7 @@ class EngineManager:
                 "venv",
                 "--python",
                 ENGINE_PYTHON_VERSION,
-                "--python-preference",
-                "managed",
+                "--managed-python",
                 str(target),
             ],
             stage="python",
