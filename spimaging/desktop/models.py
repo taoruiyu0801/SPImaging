@@ -72,8 +72,16 @@ def cuda_required() -> bool:
     return os.environ.get("SPIMAGING_CUDA_REQUIRED", "").strip() == "1"
 
 
+def runtime_variant() -> str | None:
+    """Return the launcher-selected engine variant, if running from an install."""
+
+    value = os.environ.get("SPIMAGING_RUNTIME_VARIANT", "").strip().lower()
+    return value if value in {"cpu", "cuda"} else None
+
+
 def desktop_device_labels() -> dict[str, str]:
-    return {"cuda": DEVICE_LABELS["cuda"]} if cuda_required() else dict(DEVICE_LABELS)
+    variant = runtime_variant()
+    return {variant: DEVICE_LABELS[variant]} if variant is not None else dict(DEVICE_LABELS)
 
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "interrupted"}
 RESUMABLE_STATUSES = {"failed", "cancelled", "interrupted"}
@@ -846,8 +854,9 @@ class SettingsStore:
         self.defaults = defaults or ApplicationPaths.default()
 
     def default_settings(self) -> DesktopSettings:
+        selected_runtime = runtime_variant()
         return DesktopSettings(
-            device="cuda" if cuda_required() else "auto",
+            device=selected_runtime or "auto",
             runs_dir=str(self.defaults.runs),
             cache_dir=str(self.defaults.cache),
         )
@@ -865,8 +874,9 @@ class SettingsStore:
                 raise ValueError(f"设置包含未知字段：{', '.join(sorted(unknown))}")
             settings = DesktopSettings(**dict(raw))
             settings.validate()
-            if cuda_required() and settings.device != "cuda":
-                settings = replace(settings, device="cuda")
+            selected_runtime = runtime_variant()
+            if selected_runtime is not None and settings.device != selected_runtime:
+                settings = replace(settings, device=selected_runtime)
             return settings
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             # A damaged preferences file must not prevent the workbench opening.
@@ -912,4 +922,5 @@ __all__ = [
     "desktop_device_labels",
     "load_sample_inspection",
     "next_run_directory",
+    "runtime_variant",
 ]

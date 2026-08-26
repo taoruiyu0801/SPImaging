@@ -1109,7 +1109,7 @@ class SettingsPage(QWidget):
         )
         self.update_check = QCheckBox(tr("SettingsPage", "每 24 小时最多自动检查一次更新"))
         self.update_check.setChecked(settings.update_checks)
-        self.repair_button = QPushButton(tr("SettingsPage", "重新检测或安装 CUDA 计算引擎"))
+        self.repair_button = QPushButton(tr("SettingsPage", "切换或修复 CPU/GPU 计算环境"))
         self.diagnostic_button = QPushButton(tr("SettingsPage", "导出脱敏诊断包…"))
         row = QHBoxLayout()
         row.addWidget(self.repair_button)
@@ -1158,14 +1158,17 @@ class SettingsPage(QWidget):
         if self._probe is not None and self._probe.isRunning():
             return
         self.probe_button.setEnabled(False)
-        self.probe_result.setText(tr("SettingsPage", "正在检测 CUDA 与显存可用性…"))
+        self.probe_result.setText(tr("SettingsPage", "正在检测所选计算设备…"))
         self._probe = DeviceProbeThread(self.device_combo.currentData(), self.gpu_spin.value(), self)
         self._probe.result_ready.connect(self._probe_finished)
         self._probe.finished.connect(lambda: self.probe_button.setEnabled(True))
         self._probe.start()
 
     def _probe_finished(self, reason: str, fallback: bool) -> None:
-        prefix = tr("SettingsPage", "CUDA 不可用：") if fallback else tr("SettingsPage", "CUDA 可用：")
+        if self.device_combo.currentData() == "cpu":
+            prefix = tr("SettingsPage", "CPU 可用：")
+        else:
+            prefix = tr("SettingsPage", "CUDA 不可用：") if fallback else tr("SettingsPage", "CUDA 可用：")
         self.probe_result.setText(prefix + reason)
 
     def _export_diagnostics(self) -> None:

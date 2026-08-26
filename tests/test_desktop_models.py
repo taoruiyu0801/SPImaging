@@ -20,6 +20,7 @@ from spimaging.desktop.models import (
     RunProgressState,
     SettingsStore,
     clone_run_config,
+    desktop_device_labels,
     load_sample_inspection,
     next_run_directory,
 )
@@ -290,6 +291,23 @@ def test_settings_round_trip_and_corruption_fallback(tmp_path: Path) -> None:
     fallback = store.load()
     assert fallback.device == "auto"
     assert fallback.runs_dir == str(paths.runs)
+
+
+def test_installed_cpu_engine_locks_desktop_runs_to_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SPIMAGING_RUNTIME_VARIANT", "cpu")
+    monkeypatch.setenv("SPIMAGING_CUDA_REQUIRED", "0")
+    paths = ApplicationPaths(
+        tmp_path,
+        tmp_path / "runs",
+        tmp_path / "cache",
+        tmp_path / "history.db",
+        tmp_path / "settings.json",
+    )
+    store = SettingsStore(paths.settings_file, paths)
+    assert store.default_settings().device == "cpu"
+    assert desktop_device_labels() == {"cpu": "CPU"}
 
 
 def test_next_run_directory_is_readable_and_unique(tmp_path: Path) -> None:

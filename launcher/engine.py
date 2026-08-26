@@ -14,11 +14,14 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from typing import Callable, Iterable, Sequence
 
 from .errors import LauncherError
@@ -27,6 +30,7 @@ from .errors import LauncherError
 ENGINE_SCHEMA_VERSION = 1
 ENGINE_PYTHON_VERSION = "3.12"
 MINIMUM_FREE_BYTES = 8 * 1024**3
+MINIMUM_CPU_FREE_BYTES = 4 * 1024**3
 REQUIRED_MODULES = (
     "PySide6",
     "numpy",
@@ -82,6 +86,42 @@ CUDA_PROFILES = (
     ),
 )
 
+CPU_PROFILE = CudaProfile(
+    "torch-2.9.1-cpu",
+    "torch==2.9.1",
+    "https://download.pytorch.org/whl/cpu",
+    "",
+)
+
+
+@dataclass(frozen=True)
+class EngineProgress:
+    """One user-visible engine discovery or installation event."""
+
+    stage: str
+    step: int
+    total_steps: int
+    percent: float
+    message: str
+    kind: str = "status"
+
+
+EngineProgressCallback = Callable[[EngineProgress], None]
+
+
+def _emit(
+    callback: EngineProgressCallback | None,
+    stage: str,
+    step: int,
+    total_steps: int,
+    percent: float,
+    message: str,
+    *,
+    kind: str = "status",
+) -> None:
+    if callback is not None:
+        callback(EngineProgress(stage, step, total_steps, max(0.0, min(100.0, percent)), message, kind))
+
 
 @dataclass(frozen=True)
 class EngineProbe:
@@ -95,6 +135,7 @@ class EngineProbe:
     compute_capability: tuple[int, int] = (0, 0)
     free_memory: int = 0
     total_memory: int = 0
+    variant: str = "cuda"
 
 
 def _creationflags() -> int:
@@ -199,34 +240,54 @@ def _probe_environment(app_root: Path) -> dict[str, str]:
 
 
 _PROBE_PROGRAM = r'''
-import importlib.util, json, sys
+import importlib.util, json, platform, sys
 result = {"python_version": sys.version.split()[0]}
 required = json.loads(sys.argv[1])
+index = int(sys.argv[2])
+variant = sys.argv[3]
 missing = [name for name in required if importlib.util.find_spec(name) is None]
 if missing:
     raise RuntimeError("缺少模块：" + ", ".join(missing))
 import torch
 from PySide6 import QtWidgets
-index = int(sys.argv[2])
-if not torch.cuda.is_available():
-    raise RuntimeError("torch.cuda.is_available() 为 False")
-if index >= torch.cuda.device_count():
-    raise RuntimeError(f"GPU 编号 {index} 不存在")
-torch.cuda.set_device(index)
-device = torch.device(f"cuda:{index}")
+
+if variant == "cuda":
+    if not torch.cuda.is_available():
+        raise RuntimeError("torch.cuda.is_available() 为 False")
+    if index >= torch.cuda.device_count():
+        raise RuntimeError(f"GPU 编号 {index} 不存在")
+    torch.cuda.set_device(index)
+    device = torch.device(f"cuda:{index}")
+else:
+    if torch.version.cuda:
+        raise RuntimeError(
+            f"检测到 CUDA 版 PyTorch（运行时 {torch.version.cuda}），CPU 模式要求独立的 CPU 套件"
+        )
+    device = torch.device("cpu")
+
 # Elementwise kernels catch wheels that can enumerate a new GPU but contain no
-# code for its architecture.  Conv3d mirrors SPImaging's real model workload.
+# code for its architecture. Conv3d mirrors SPImaging's real model workload on
+# both engine variants.
 x = torch.arange(256, dtype=torch.float32, device=device).reshape(1, 1, 8, 8, 4)
 weight = torch.ones((1, 1, 3, 3, 3), dtype=torch.float32, device=device)
 y = torch.nn.functional.conv3d(x, weight, padding=1)
 value = float((y + 1).mean().item())
-torch.cuda.synchronize(index)
-free, total = torch.cuda.mem_get_info(index)
-capability = torch.cuda.get_device_capability(index)
+
+if variant == "cuda":
+    torch.cuda.synchronize(index)
+    free, total = torch.cuda.mem_get_info(index)
+    capability = torch.cuda.get_device_capability(index)
+    device_name = torch.cuda.get_device_name(index)
+else:
+    free = total = 0
+    capability = (0, 0)
+    device_name = platform.processor() or "CPU"
+
 result.update({
+    "variant": variant,
     "torch_version": str(torch.__version__),
     "cuda_version": str(torch.version.cuda or ""),
-    "device_name": torch.cuda.get_device_name(index),
+    "device_name": device_name,
     "compute_capability": list(capability),
     "free_memory": int(free),
     "total_memory": int(total),
@@ -241,20 +302,24 @@ def probe_engine(
     python: str | Path,
     app_root: str | Path,
     *,
+    variant: str = "cuda",
     gpu_index: int = 0,
     timeout_seconds: int = 45,
 ) -> EngineProbe:
+    if variant not in {"cpu", "cuda"}:
+        raise ValueError("engine variant must be cpu or cuda")
     executable = Path(python).expanduser()
     try:
         executable = executable.resolve(strict=True)
     except OSError:
-        return EngineProbe(str(executable), False, "Python 可执行文件不存在")
+        return EngineProbe(str(executable), False, "Python 可执行文件不存在", variant=variant)
     command = [
         str(executable),
         "-c",
         _PROBE_PROGRAM,
         json.dumps(REQUIRED_MODULES),
         str(gpu_index),
+        variant,
     ]
     try:
         completed = subprocess.run(
@@ -268,10 +333,15 @@ def probe_engine(
             creationflags=_creationflags(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return EngineProbe(str(executable), False, f"CUDA 自检无法运行：{exc}")
+        return EngineProbe(str(executable), False, f"{variant.upper()} 自检无法运行：{exc}", variant=variant)
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "没有诊断输出").strip().splitlines()
-        return EngineProbe(str(executable), False, detail[-1] if detail else "CUDA 自检失败")
+        return EngineProbe(
+            str(executable),
+            False,
+            detail[-1] if detail else f"{variant.upper()} 自检失败",
+            variant=variant,
+        )
     try:
         payload = json.loads(completed.stdout.strip().splitlines()[-1])
         capability = tuple(int(item) for item in payload.get("compute_capability", (0, 0)))
@@ -288,9 +358,12 @@ def probe_engine(
             (capability[0], capability[1]),
             int(payload.get("free_memory", 0)),
             int(payload.get("total_memory", 0)),
+            str(payload.get("variant", variant)),
         )
     except (IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        return EngineProbe(str(executable), False, f"CUDA 自检输出无法解析：{exc}")
+        return EngineProbe(
+            str(executable), False, f"{variant.upper()} 自检输出无法解析：{exc}", variant=variant
+        )
 
 
 def _python_from_record(path: Path) -> Path | None:
@@ -324,7 +397,10 @@ def discover_python_candidates(
     install_root: str | Path,
     *,
     explicit: str | Path | None = None,
+    variant: str = "cuda",
 ) -> list[Path]:
+    if variant not in {"cpu", "cuda"}:
+        raise ValueError("engine variant must be cpu or cuda")
     root = Path(install_root).expanduser().resolve()
     candidates: list[Path] = []
     if explicit:
@@ -332,9 +408,10 @@ def discover_python_candidates(
     environment = os.environ.get("SPIMAGING_ENGINE_PYTHON", "").strip()
     if environment:
         candidates.append(Path(environment))
-    recorded = _python_from_record(root / "metadata" / "engine.json")
-    if recorded is not None:
-        candidates.append(recorded)
+    for record_name in (f"engine-{variant}.json", "engine.json"):
+        recorded = _python_from_record(root / "metadata" / record_name)
+        if recorded is not None:
+            candidates.append(recorded)
 
     profile = Path(os.environ.get("USERPROFILE", str(Path.home())))
     known_roots = (
@@ -380,7 +457,20 @@ def discover_python_candidates(
     return _deduplicate(candidates)
 
 
-class CudaEngineManager:
+def _directory_size(root: Path) -> int:
+    total = 0
+    if not root.exists():
+        return 0
+    for current, _directories, files in os.walk(root):
+        for name in files:
+            try:
+                total += (Path(current) / name).stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+class EngineManager:
     def __init__(self, install_root: str | Path, app_root: str | Path) -> None:
         self.install_root = Path(install_root).expanduser().resolve()
         self.app_root = Path(app_root).expanduser().resolve()
@@ -390,22 +480,35 @@ class CudaEngineManager:
         self,
         *,
         explicit: str | Path | None = None,
+        variant: str = "cuda",
         gpu_index: int = 0,
-        progress: Callable[[str], None] | None = None,
+        progress: EngineProgressCallback | None = None,
     ) -> tuple[EngineProbe | None, list[EngineProbe]]:
+        if variant not in {"cpu", "cuda"}:
+            raise ValueError("engine variant must be cpu or cuda")
         attempts: list[EngineProbe] = []
-        for candidate in discover_python_candidates(self.install_root, explicit=explicit):
-            if progress:
-                progress(f"正在验证 {candidate}")
-            result = probe_engine(candidate, self.app_root, gpu_index=gpu_index)
+        candidates = discover_python_candidates(self.install_root, explicit=explicit, variant=variant)
+        label = "CPU" if variant == "cpu" else "NVIDIA GPU"
+        _emit(progress, "discover", 2, 6, 8, f"发现 {len(candidates)} 个 Python 环境，开始检查 {label} 兼容性")
+        for index, candidate in enumerate(candidates, start=1):
+            _emit(
+                progress,
+                "discover",
+                2,
+                6,
+                8 + (7 * index / max(1, len(candidates))),
+                f"[{index}/{len(candidates)}] 正在验证 {candidate}",
+            )
+            result = probe_engine(candidate, self.app_root, variant=variant, gpu_index=gpu_index)
             attempts.append(result)
             if result.compatible:
+                _emit(progress, "discover", 2, 6, 15, f"环境通过自检：{candidate}", kind="log")
                 self.save(result, source="existing")
                 return result, attempts
+            _emit(progress, "discover", 2, 6, 15, f"环境不兼容：{candidate}；{result.reason}", kind="log")
         return None, attempts
 
     def save(self, probe: EngineProbe, *, source: str, profile: str = "") -> None:
-        self.record_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema_version": ENGINE_SCHEMA_VERSION,
             "source": source,
@@ -413,20 +516,20 @@ class CudaEngineManager:
             "validated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             **asdict(probe),
         }
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=".engine.", suffix=".tmp", dir=self.record_path.parent
-        )
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.record_path)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
+        for path in (self.record_path.with_name(f"engine-{probe.variant}.json"), self.record_path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(prefix=".engine.", suffix=".tmp", dir=path.parent)
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                    json.dump(payload, handle, ensure_ascii=False, indent=2)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, path)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
 
     def locate_uv(self) -> Path:
         candidates = []
@@ -441,15 +544,61 @@ class CudaEngineManager:
                 return candidate.resolve()
         raise LauncherError("找不到 uv 安装器。请重新安装 SPImaging，或从 https://astral.sh/uv 安装 uv。")
 
+    @staticmethod
+    def _discard_failed_target(
+        target: Path,
+        releases_root: Path,
+        progress: EngineProgressCallback | None,
+    ) -> None:
+        """Remove only the directory created by the current failed attempt."""
+
+        try:
+            resolved_target = target.resolve()
+            resolved_releases = releases_root.resolve()
+            if resolved_target.parent != resolved_releases:
+                raise LauncherError(f"拒绝清理预期目录之外的失败环境：{resolved_target}")
+            if resolved_target.exists():
+                shutil.rmtree(resolved_target)
+                _emit(
+                    progress,
+                    "cleanup",
+                    6,
+                    6,
+                    100,
+                    f"已清理本次失败环境；下载缓存保留，可用于重试：{resolved_target.name}",
+                    kind="log",
+                )
+        except OSError as exc:
+            _emit(
+                progress,
+                "cleanup",
+                6,
+                6,
+                100,
+                f"无法清理本次失败环境 {target}：{exc}",
+                kind="log",
+            )
+
     def _run_install_command(
         self,
         command: Sequence[str],
-        progress: Callable[[str], None] | None,
+        progress: EngineProgressCallback | None,
+        *,
+        stage: str,
+        step: int,
+        total_steps: int,
+        start_percent: float,
+        end_percent: float,
+        label: str,
+        activity_roots: Sequence[Path],
+        environment_overrides: dict[str, str],
     ) -> None:
         environment = os.environ.copy()
         environment["PYTHONUTF8"] = "1"
         environment["UV_NO_PROGRESS"] = "1"
         environment["UV_LINK_MODE"] = "copy"
+        environment.update(environment_overrides)
+        _emit(progress, stage, step, total_steps, start_percent, label)
         try:
             process = subprocess.Popen(
                 list(command),
@@ -465,41 +614,116 @@ class CudaEngineManager:
             )
         except OSError as exc:
             raise LauncherError(f"无法启动计算引擎安装：{exc}") from exc
+
+        output: queue.Queue[str | None] = queue.Queue()
         lines: list[str] = []
         assert process.stdout is not None
-        for raw in process.stdout:
-            line = raw.strip()
-            if line:
-                lines.append(line)
-                if progress:
-                    progress(line)
+
+        def read_output() -> None:
+            try:
+                for raw in process.stdout:
+                    line = raw.rstrip("\r\n")
+                    if line:
+                        output.put(line)
+            finally:
+                output.put(None)
+
+        reader = threading.Thread(target=read_output, name="spimaging-engine-log", daemon=True)
+        reader.start()
+        started = time.monotonic()
+        last_heartbeat = started
+        last_measurement = started
+        baseline_size = sum(_directory_size(path) for path in activity_roots)
+        previous_size = baseline_size
+        reader_done = False
+        while not reader_done or process.poll() is None or not output.empty():
+            try:
+                item = output.get(timeout=0.25)
+            except queue.Empty:
+                item = ""
+            if item is None:
+                reader_done = True
+            elif item:
+                lines.append(item)
+                _emit(progress, stage, step, total_steps, start_percent, item, kind="log")
+            now = time.monotonic()
+            if now - last_heartbeat >= 1.0 and process.poll() is None:
+                elapsed = int(now - started)
+                activity = f"{label}仍在进行，已用 {elapsed // 60:02d}:{elapsed % 60:02d}"
+                if now - last_measurement >= 2.0:
+                    current_size = sum(_directory_size(path) for path in activity_roots)
+                    delta = max(0, current_size - previous_size)
+                    total_delta = max(0, current_size - baseline_size)
+                    speed = delta / max(0.1, now - last_measurement)
+                    activity += f"；本次新增/缓存 {total_delta / 1024**2:.1f} MiB"
+                    if speed > 0:
+                        activity += f"；最近约 {speed / 1024**2:.1f} MiB/s"
+                    previous_size = current_size
+                    last_measurement = now
+                _emit(progress, stage, step, total_steps, start_percent, activity, kind="activity")
+                last_heartbeat = now
         returncode = process.wait()
+        reader.join(timeout=2)
         if returncode != 0:
             detail = lines[-1] if lines else f"exit code {returncode}"
-            raise LauncherError(f"CUDA 计算引擎安装失败：{detail}")
+            raise LauncherError(f"{label}失败：{detail}")
+        _emit(progress, stage, step, total_steps, end_percent, f"{label}完成", kind="log")
 
     def install(
         self,
-        device: NvidiaDevice,
+        device: NvidiaDevice | None,
         *,
+        variant: str = "cuda",
         gpu_index: int = 0,
-        progress: Callable[[str], None] | None = None,
+        progress: EngineProgressCallback | None = None,
     ) -> EngineProbe:
-        profile = select_cuda_profile(device)
+        if variant not in {"cpu", "cuda"}:
+            raise ValueError("engine variant must be cpu or cuda")
+        if variant == "cuda":
+            if device is None:
+                raise LauncherError("GPU 模式需要先检测 NVIDIA 显卡和驱动")
+            profile = select_cuda_profile(device)
+        else:
+            profile = CPU_PROFILE
         engine_root = self.install_root / "engine"
         engine_root.mkdir(parents=True, exist_ok=True)
         free = shutil.disk_usage(engine_root).free
-        if free < MINIMUM_FREE_BYTES:
+        minimum_free = MINIMUM_FREE_BYTES if variant == "cuda" else MINIMUM_CPU_FREE_BYTES
+        if free < minimum_free:
             raise LauncherError(
-                f"CUDA 计算引擎至少需要 8 GiB 可用空间，当前只有 {free / 1024**3:.1f} GiB。"
+                f"{variant.upper()} 计算引擎至少需要 {minimum_free / 1024**3:.0f} GiB 可用空间，"
+                f"当前只有 {free / 1024**3:.1f} GiB。"
             )
+        _emit(
+            progress,
+            "preflight",
+            1,
+            6,
+            4,
+            f"磁盘预检通过：可用 {free / 1024**3:.1f} GiB；配置 {profile.profile_id}",
+        )
         stamp = datetime.now().strftime("%Y%m%d%H%M%S")
         target = engine_root / "releases" / f"{profile.profile_id}-py312-{stamp}"
         target.parent.mkdir(parents=True, exist_ok=True)
+        releases_root = target.parent
+        cache_root = engine_root / "cache" / variant
+        python_root = engine_root / "python"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        python_root.mkdir(parents=True, exist_ok=True)
+        environment_overrides = {
+            "UV_CACHE_DIR": str(cache_root),
+            "UV_PYTHON_INSTALL_DIR": str(python_root),
+        }
         uv = self.locate_uv()
-        if progress:
-            progress(f"创建 Python {ENGINE_PYTHON_VERSION} 轻量环境")
-        self._run_install_command(
+
+        def run_step(command: Sequence[str], **kwargs: object) -> None:
+            try:
+                self._run_install_command(command, progress, **kwargs)  # type: ignore[arg-type]
+            except Exception:
+                self._discard_failed_target(target, releases_root, progress)
+                raise
+
+        run_step(
             [
                 str(uv),
                 "venv",
@@ -509,10 +733,17 @@ class CudaEngineManager:
                 "managed",
                 str(target),
             ],
-            progress,
+            stage="python",
+            step=2,
+            total_steps=6,
+            start_percent=5,
+            end_percent=15,
+            label=f"创建 Python {ENGINE_PYTHON_VERSION} 私有环境",
+            activity_roots=(target, cache_root, python_root),
+            environment_overrides=environment_overrides,
         )
         python = target / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-        self._run_install_command(
+        run_step(
             [
                 str(uv),
                 "pip",
@@ -523,19 +754,59 @@ class CudaEngineManager:
                 "--index-url",
                 profile.index_url,
             ],
-            progress,
+            stage="pytorch",
+            step=3,
+            total_steps=6,
+            start_percent=16,
+            end_percent=65,
+            label=f"下载并安装 PyTorch {variant.upper()} 套件",
+            activity_roots=(target, cache_root),
+            environment_overrides=environment_overrides,
         )
-        self._run_install_command(
-            [str(uv), "pip", "install", "--python", str(python), *BASE_REQUIREMENTS],
-            progress,
+        run_step(
+            [
+                str(uv),
+                "pip",
+                "install",
+                "--python",
+                str(python),
+                profile.torch_requirement,
+                *BASE_REQUIREMENTS,
+                "--index-url",
+                profile.index_url,
+                "--extra-index-url",
+                "https://pypi.org/simple",
+                "--index-strategy",
+                "unsafe-best-match",
+            ],
+            stage="dependencies",
+            step=4,
+            total_steps=6,
+            start_percent=66,
+            end_percent=90,
+            label="安装 SPImaging 图形界面和科学计算依赖",
+            activity_roots=(target, cache_root),
+            environment_overrides=environment_overrides,
         )
-        if progress:
-            progress("正在执行真实 CUDA 张量与 3D 卷积自检")
-        result = probe_engine(python, self.app_root, gpu_index=gpu_index, timeout_seconds=120)
+        test_label = "真实 CUDA 张量与 3D 卷积" if variant == "cuda" else "CPU 张量与 3D 卷积"
+        _emit(progress, "self-test", 5, 6, 92, f"正在执行{test_label}自检")
+        result = probe_engine(
+            python,
+            self.app_root,
+            variant=variant,
+            gpu_index=gpu_index,
+            timeout_seconds=120,
+        )
         if not result.compatible:
-            raise LauncherError(f"新计算引擎未通过 CUDA 自检：{result.reason}")
+            self._discard_failed_target(target, releases_root, progress)
+            raise LauncherError(f"新计算引擎未通过 {variant.upper()} 自检：{result.reason}")
         self.save(result, source="managed", profile=profile.profile_id)
+        _emit(progress, "complete", 6, 6, 100, f"{variant.upper()} 计算引擎安装并验证完成")
         return result
+
+
+# Kept as a public alias for the previous beta API and third-party scripts.
+CudaEngineManager = EngineManager
 
 
 def engine_environment(probe: EngineProbe, app_root: str | Path) -> dict[str, str]:
@@ -548,8 +819,8 @@ def engine_environment(probe: EngineProbe, app_root: str | Path) -> dict[str, st
     ).rstrip(os.pathsep)
     environment["SPIMAGING_ENGINE_PYTHON"] = str(python)
     environment["SPIMAGING_APP_ROOT"] = str(Path(app_root).resolve())
-    environment["SPIMAGING_CUDA_REQUIRED"] = "1"
-    environment["SPIMAGING_RUNTIME_VARIANT"] = "cuda"
+    environment["SPIMAGING_CUDA_REQUIRED"] = "1" if probe.variant == "cuda" else "0"
+    environment["SPIMAGING_RUNTIME_VARIANT"] = probe.variant
     return environment
 
 
@@ -581,10 +852,13 @@ def launch_desktop_with_engine(
 
 __all__ = [
     "BASE_REQUIREMENTS",
+    "CPU_PROFILE",
     "CUDA_PROFILES",
     "CudaEngineManager",
     "CudaProfile",
+    "EngineManager",
     "EngineProbe",
+    "EngineProgress",
     "NvidiaDevice",
     "discover_python_candidates",
     "engine_environment",
