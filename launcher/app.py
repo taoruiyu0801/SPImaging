@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 from dataclasses import dataclass
+from datetime import datetime
 import json
 from pathlib import Path
 import os
@@ -22,6 +23,7 @@ from .download import DownloadTransport, LocalDirectoryTransport, UrllibTranspor
 from .errors import LauncherError
 from .engine import (
     CudaEngineManager,
+    EngineProgress,
     EngineProbe,
     NvidiaDevice,
     launch_desktop_with_engine,
@@ -466,6 +468,8 @@ def _legacy_runtime_requested(args: argparse.Namespace) -> bool:
 
 
 def _engine_summary(probe: EngineProbe) -> str:
+    if probe.variant == "cpu":
+        return f"CPU · PyTorch {probe.torch_version} · Python {probe.python_version}"
     capability = f"sm_{probe.compute_capability[0]}{probe.compute_capability[1]}"
     memory = f"{probe.total_memory / 1024**3:.1f} GiB" if probe.total_memory else "未知显存"
     return (
@@ -474,23 +478,98 @@ def _engine_summary(probe: EngineProbe) -> str:
     )
 
 
+def _engine_choice_path(install_root: Path) -> Path:
+    return install_root.expanduser().resolve() / "metadata" / "engine-choice.json"
+
+
+def _load_engine_choice(args: argparse.Namespace) -> str | None:
+    if args.runtime in {"cpu", "cuda"}:
+        return str(args.runtime)
+    for path in (
+        _engine_choice_path(args.install_root),
+        args.install_root.expanduser().resolve() / "metadata" / "engine.json",
+    ):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(raw, dict):
+            value = raw.get("variant")
+            if value in {"cpu", "cuda"}:
+                return str(value)
+    preference = load_desktop_preferences(args.install_root).get("device")
+    return str(preference) if preference in {"cpu", "cuda"} else None
+
+
+def _save_engine_choice(install_root: Path, variant: str) -> None:
+    if variant not in {"cpu", "cuda"}:
+        raise ValueError("engine variant must be cpu or cuda")
+    path = _engine_choice_path(install_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = {
+        "schema_version": 1,
+        "variant": variant,
+        "selected_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _headless_engine_logger(install_root: Path) -> tuple[Path, Callable[[EngineProgress], None]]:
+    logs_root = install_root.expanduser().resolve() / "logs"
+    logs_root.mkdir(parents=True, exist_ok=True)
+    path = logs_root / f"engine-install-{datetime.now():%Y%m%d-%H%M%S}.log"
+
+    def emit(event: EngineProgress) -> None:
+        line = f"[{datetime.now():%H:%M:%S}] [{event.step}/{event.total_steps}] {event.message}"
+        print(line, flush=True)
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(line + "\n")
+
+    return path, emit
+
+
 def _run_engine_headless(args: argparse.Namespace) -> int:
     app_root = resolve_app_root(args.app_root)
     manager = CudaEngineManager(args.install_root, app_root)
-    device = probe_nvidia_device()
+    log_path, report = _headless_engine_logger(args.install_root)
+    print(f"安装日志：{log_path}", flush=True)
+    variant = _load_engine_choice(args)
+    if variant is None:
+        try:
+            device = probe_nvidia_device()
+            select_cuda_profile(device)
+            variant = "cuda"
+        except LauncherError:
+            device = None
+            variant = "cpu"
+    else:
+        device = probe_nvidia_device() if variant == "cuda" else None
+    _save_engine_choice(args.install_root, variant)
     if args.install_engine or args.repair_engine:
-        probe = manager.install(device, gpu_index=args.gpu_index, progress=print)
+        probe = manager.install(
+            device,
+            variant=variant,
+            gpu_index=args.gpu_index,
+            progress=report,
+        )
     else:
         probe, attempts = manager.find(
             explicit=args.engine_python,
+            variant=variant,
             gpu_index=args.gpu_index,
-            progress=print,
+            progress=report,
         )
         if probe is None:
             detail = attempts[-1].reason if attempts else "没有找到 Python 环境"
-            profile = select_cuda_profile(device)
+            profile = select_cuda_profile(device).profile_id if device is not None else "torch-2.9.1-cpu"
             raise LauncherError(
-                f"没有可用的 CUDA 计算引擎（{detail}）。可安装配置：{profile.profile_id}；"
+                f"没有可用的 {variant.upper()} 计算引擎（{detail}）。可安装配置：{profile}；"
                 "请使用 --install-engine。"
             )
     print(_engine_summary(probe))
@@ -514,141 +593,252 @@ def _run_engine_gui(args: argparse.Namespace) -> int:
     app_root = resolve_app_root(args.app_root)
     manager = CudaEngineManager(args.install_root, app_root)
     root = tk.Tk()
-    root.title("SPImaging CUDA 启动器")
-    root.geometry("620x340")
-    root.resizable(False, False)
-    status = tk.StringVar(value="正在检测 NVIDIA CUDA 环境……")
-    detail = tk.StringVar(value="将优先复用已有且通过真实 CUDA 运算的 PyTorch 环境。")
-    frame = ttk.Frame(root, padding=24)
+    root.title("SPImaging 运行环境")
+    root.geometry("780x650")
+    root.minsize(720, 580)
+    status = tk.StringVar(value="请选择运行方式")
+    detail = tk.StringVar(value="CPU 适合无 NVIDIA 显卡的电脑；GPU 模式会先检查驱动和已有环境。")
+    step_text = tk.StringVar(value="尚未开始")
+    progress_value = tk.DoubleVar(value=0)
+    events: queue.Queue[tuple[str, object]] = queue.Queue()
+    launched_process: subprocess.Popen[bytes] | None = None
+    selected_variant: str | None = None
+    busy = False
+
+    logs_root = args.install_root.expanduser().resolve() / "logs"
+    logs_root.mkdir(parents=True, exist_ok=True)
+    log_path = logs_root / f"engine-install-{datetime.now():%Y%m%d-%H%M%S}.log"
+    log_lock = threading.Lock()
+
+    frame = ttk.Frame(root, padding=22)
     frame.pack(fill="both", expand=True)
     ttk.Label(frame, text="SPImaging", font=("Microsoft YaHei UI", 20, "bold")).pack(anchor="w")
-    ttk.Label(frame, text="CUDA 完整实验工作台", font=("Microsoft YaHei UI", 10)).pack(anchor="w", pady=(2, 14))
-    ttk.Label(frame, textvariable=status, font=("Microsoft YaHei UI", 11)).pack(anchor="w", pady=(4, 4))
-    ttk.Label(frame, textvariable=detail, wraplength=560).pack(anchor="w")
-    bar = ttk.Progressbar(frame, mode="indeterminate")
-    bar.pack(fill="x", pady=(20, 16))
+    ttk.Label(frame, text="选择并准备本机计算环境", font=("Microsoft YaHei UI", 10)).pack(anchor="w", pady=(2, 12))
+
+    choice = ttk.Frame(frame)
+    choice.pack(fill="x", pady=(0, 12))
+    cpu_button = ttk.Button(choice, text="使用 CPU（下载 CPU 套件）", width=28)
+    cpu_button.pack(side="left", padx=(0, 8))
+    gpu_button = ttk.Button(choice, text="使用 NVIDIA GPU（检查并安装）", width=31)
+    gpu_button.pack(side="left")
+
+    ttk.Separator(frame).pack(fill="x", pady=(0, 12))
+    ttk.Label(frame, textvariable=status, font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+    ttk.Label(frame, textvariable=detail, wraplength=720).pack(anchor="w", pady=(4, 8))
+    ttk.Label(frame, textvariable=step_text).pack(anchor="w")
+    bar = ttk.Progressbar(frame, variable=progress_value, maximum=100, mode="determinate")
+    bar.pack(fill="x", pady=(6, 12))
+
+    log_header = ttk.Frame(frame)
+    log_header.pack(fill="x")
+    ttk.Label(log_header, text="安装日志（实时更新）", font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
+    ttk.Label(log_header, text=str(log_path), foreground="#666666").pack(side="right")
+    log_frame = ttk.Frame(frame)
+    log_frame.pack(fill="both", expand=True, pady=(5, 10))
+    log_widget = tk.Text(
+        log_frame,
+        height=15,
+        wrap="word",
+        state="disabled",
+        font=("Consolas", 9),
+        background="#111827",
+        foreground="#e5e7eb",
+        insertbackground="#e5e7eb",
+    )
+    scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=log_widget.yview)
+    log_widget.configure(yscrollcommand=scrollbar.set)
+    log_widget.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
     actions = ttk.Frame(frame)
     actions.pack(fill="x")
-    install_button = ttk.Button(actions, text="一键安装 CUDA 计算引擎", state="disabled")
-    install_button.pack(side="left")
+    retry_button = ttk.Button(actions, text="重试当前模式", state="disabled")
+    retry_button.pack(side="left")
+    choose_button = ttk.Button(actions, text="重新选择 CPU/GPU", state="disabled")
+    choose_button.pack(side="left", padx=(8, 0))
+    copy_button = ttk.Button(actions, text="复制全部日志")
+    copy_button.pack(side="right", padx=(8, 0))
     close_button = ttk.Button(actions, text="关闭", command=root.destroy)
     close_button.pack(side="right")
-    events: queue.Queue[tuple[str, object]] = queue.Queue()
-    selected_device: NvidiaDevice | None = None
-    launched_process: subprocess.Popen[bytes] | None = None
-    busy = True
 
-    def emit_detail(message: str) -> None:
-        events.put(("detail", message))
+    def append_log(message: str) -> None:
+        log_widget.configure(state="normal")
+        log_widget.insert("end", message + "\n")
+        log_widget.see("end")
+        log_widget.configure(state="disabled")
 
-    def detect() -> None:
-        try:
-            device = probe_nvidia_device()
-            events.put(("device", device))
-            emit_detail(
-                f"检测到 {device.name}，驱动 {device.driver_version}，"
-                f"计算能力 {device.compute_capability[0]}.{device.compute_capability[1]}。"
-            )
-            if args.repair_engine:
-                result = manager.install(device, gpu_index=args.gpu_index, progress=emit_detail)
-                events.put(("done", result))
-                return
-            result, attempts = manager.find(
-                explicit=args.engine_python,
-                gpu_index=args.gpu_index,
-                progress=emit_detail,
-            )
-            if result is not None:
-                events.put(("done", result))
-                return
-            profile = select_cuda_profile(device)
-            last = attempts[-1].reason if attempts else "没有发现 Python 环境"
-            if args.install_engine:
-                events.put(("detail", f"没有可复用环境，将安装 {profile.profile_id}：{last}"))
-                result = manager.install(device, gpu_index=args.gpu_index, progress=emit_detail)
-                events.put(("done", result))
-            else:
-                events.put(("missing", (device, profile.profile_id, last)))
-        except Exception as error:
-            events.put(("error", error))
+    def record(message: str) -> str:
+        line = f"[{datetime.now():%H:%M:%S}] {message}"
+        with log_lock:
+            with log_path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(line + "\n")
+        return line
 
-    def install_selected() -> None:
-        nonlocal busy
-        if selected_device is None or busy:
+    def emit_progress(event: EngineProgress) -> None:
+        line = record(f"[{event.step}/{event.total_steps}] {event.message}")
+        events.put(("progress", (event, line)))
+
+    def set_choice_enabled(enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        cpu_button.configure(state=state)
+        gpu_button.configure(state=state)
+
+    def run_variant(variant: str, *, force: bool = False) -> None:
+        nonlocal selected_variant, busy
+        if busy:
             return
-        accepted = messagebox.askyesno(
-            "安装 CUDA 计算引擎",
-            "将联网下载 Python 和 PyTorch CUDA 组件，至少需要 8 GiB 可用磁盘空间。\n\n"
-            "不会安装或修改 NVIDIA 驱动，也不会使用 Conda。是否继续？",
-            parent=root,
-        )
-        if not accepted:
-            return
+        selected_variant = variant
         busy = True
-        install_button.configure(state="disabled")
+        _save_engine_choice(args.install_root, variant)
+        set_choice_enabled(False)
+        retry_button.configure(state="disabled")
+        choose_button.configure(state="disabled")
         close_button.configure(state="disabled")
-        status.set("正在安装 CUDA 计算引擎……")
-        bar.start(12)
+        progress_value.set(1)
+        label = "CPU" if variant == "cpu" else "NVIDIA GPU"
+        status.set(f"正在准备 {label} 运行环境")
+        detail.set("下面会持续显示每一步和完整日志；长时间下载时每秒都会显示已用时间。")
+        append_log(record(f"用户选择 {label} 模式；应用目录：{app_root}"))
 
         def work() -> None:
             try:
-                result = manager.install(selected_device, gpu_index=args.gpu_index, progress=emit_detail)
+                device: NvidiaDevice | None = None
+                emit_progress(EngineProgress("hardware", 1, 6, 2, f"开始检查 {label} 模式"))
+                if variant == "cuda":
+                    emit_progress(EngineProgress("hardware", 1, 6, 3, "正在运行 nvidia-smi 检查显卡和驱动"))
+                    device = probe_nvidia_device()
+                    profile = select_cuda_profile(device)
+                    emit_progress(
+                        EngineProgress(
+                            "hardware",
+                            1,
+                            6,
+                            5,
+                            f"检测到 {device.name}；驱动 {device.driver_version}；"
+                            f"计算能力 {device.compute_capability[0]}.{device.compute_capability[1]}；"
+                            f"匹配 {profile.profile_id}",
+                        )
+                    )
+                else:
+                    emit_progress(EngineProgress("hardware", 1, 6, 5, "CPU 模式无需 NVIDIA 显卡或 CUDA"))
+
+                result: EngineProbe | None = None
+                attempts: list[EngineProbe] = []
+                if not force and not args.install_engine and not args.repair_engine:
+                    result, attempts = manager.find(
+                        explicit=args.engine_python,
+                        variant=variant,
+                        gpu_index=args.gpu_index,
+                        progress=emit_progress,
+                    )
+                if result is None:
+                    if attempts:
+                        emit_progress(
+                            EngineProgress(
+                                "discover",
+                                2,
+                                6,
+                                15,
+                                f"已有环境均不兼容，最后一次原因：{attempts[-1].reason}",
+                                "log",
+                            )
+                        )
+                    emit_progress(
+                        EngineProgress("install", 2, 6, 15, f"没有可复用的 {label} 环境，开始创建私有环境")
+                    )
+                    result = manager.install(
+                        device,
+                        variant=variant,
+                        gpu_index=args.gpu_index,
+                        progress=emit_progress,
+                    )
                 events.put(("done", result))
             except Exception as error:
+                record(f"失败：{type(error).__name__}: {error}")
                 events.put(("error", error))
 
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=work, name=f"spimaging-{variant}-setup", daemon=True).start()
 
-    install_button.configure(command=install_selected)
+    def reset_choice() -> None:
+        nonlocal selected_variant, busy
+        if busy:
+            return
+        selected_variant = None
+        status.set("请选择运行方式")
+        detail.set("CPU 适合无 NVIDIA 显卡的电脑；GPU 模式会先检查驱动和已有环境。")
+        step_text.set("尚未开始")
+        progress_value.set(0)
+        retry_button.configure(state="disabled")
+        choose_button.configure(state="disabled")
+        set_choice_enabled(True)
+
+    def copy_logs() -> None:
+        try:
+            content = log_path.read_text(encoding="utf-8")
+        except OSError as error:
+            messagebox.showerror("无法读取日志", str(error), parent=root)
+            return
+        root.clipboard_clear()
+        root.clipboard_append(content)
+        detail.set("完整安装日志已复制到剪贴板。")
+
+    cpu_button.configure(command=lambda: run_variant("cpu"))
+    gpu_button.configure(command=lambda: run_variant("cuda"))
+    retry_button.configure(command=lambda: selected_variant and run_variant(selected_variant))
+    choose_button.configure(command=reset_choice)
+    copy_button.configure(command=copy_logs)
 
     def poll() -> None:
-        nonlocal selected_device, launched_process, busy
+        nonlocal launched_process, busy
         try:
             while True:
                 kind, payload = events.get_nowait()
-                if kind == "detail":
-                    detail.set(str(payload))
-                elif kind == "device":
-                    selected_device = payload  # type: ignore[assignment]
-                elif kind == "missing":
-                    device, profile, last = payload  # type: ignore[misc]
-                    selected_device = device
-                    busy = False
-                    bar.stop()
-                    status.set("需要 CUDA 计算引擎")
-                    detail.set(f"将使用兼容配置 {profile}。最近一次检测：{last}")
-                    install_button.configure(state="normal")
+                if kind == "progress":
+                    event, line = payload  # type: ignore[misc]
+                    progress_value.set(event.percent)
+                    step_text.set(f"第 {event.step}/{event.total_steps} 步 · {event.stage}")
+                    detail.set(event.message)
+                    append_log(line)
                 elif kind == "done":
                     probe = payload  # type: ignore[assignment]
                     busy = False
-                    bar.stop()
-                    bar.configure(mode="determinate", maximum=100, value=100)
-                    status.set("CUDA 环境已通过自检")
+                    progress_value.set(100)
+                    status.set(f"{probe.variant.upper()} 环境已通过自检")
+                    step_text.set("第 6/6 步 · complete")
                     detail.set(_engine_summary(probe))
-                    install_button.configure(state="disabled")
-                    launched_process = launch_desktop_with_engine(
-                        probe,
-                        app_root,
-                        launcher_executable=_launcher_executable(),
-                    )
-                    root.after(500, root.destroy)
+                    append_log(record(f"环境就绪：{_engine_summary(probe)}；Python：{probe.python}"))
+                    close_button.configure(state="normal")
+                    if not args.no_launch:
+                        launched_process = launch_desktop_with_engine(
+                            probe,
+                            app_root,
+                            launcher_executable=_launcher_executable(),
+                        )
+                        root.after(900, root.destroy)
                 elif kind == "error":
                     busy = False
-                    bar.stop()
-                    status.set("CUDA 启动失败")
-                    detail.set(str(payload))
+                    status.set("环境准备失败")
+                    detail.set(f"{payload}。完整诊断已保存在：{log_path}")
+                    append_log(record(f"可复制此日志进行诊断：{log_path}"))
+                    retry_button.configure(state="normal")
+                    choose_button.configure(state="normal")
                     close_button.configure(state="normal")
-                    if selected_device is not None:
-                        install_button.configure(state="normal")
-                    messagebox.showerror("SPImaging CUDA 启动失败", str(payload), parent=root)
+                    messagebox.showerror(
+                        "SPImaging 环境准备失败",
+                        f"{payload}\n\n日志：{log_path}",
+                        parent=root,
+                    )
         except queue.Empty:
             pass
         if root.winfo_exists():
             root.after(100, poll)
 
-    bar.start(12)
-    close_button.configure(state="disabled" if args.repair_engine else "normal")
-    threading.Thread(target=detect, daemon=True).start()
+    initial = None if args.repair_engine else _load_engine_choice(args)
+    append_log(record(f"启动器开始；日志文件：{log_path}"))
+    if initial in {"cpu", "cuda"}:
+        root.after(150, lambda value=initial: run_variant(value))
+    else:
+        set_choice_enabled(True)
     root.after(100, poll)
     root.mainloop()
     if launched_process is not None:

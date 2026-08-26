@@ -9,8 +9,12 @@ from unittest.mock import patch
 
 import pytest
 
+from launcher.app import _load_engine_choice, _save_engine_choice, build_parser
 from launcher.engine import (
+    CudaEngineManager,
+    CPU_PROFILE,
     EngineProbe,
+    EngineProgress,
     NvidiaDevice,
     engine_environment,
     probe_engine,
@@ -72,6 +76,129 @@ def test_failed_cuda_kernel_probe_is_not_accepted(tmp_path: Path) -> None:
         result = probe_engine(python, app)
     assert not result.compatible
     assert "no kernel image" in result.reason
+
+
+def test_cpu_profile_and_real_conv3d_probe_are_separate_from_cuda(tmp_path: Path) -> None:
+    assert CPU_PROFILE.index_url.endswith("/cpu")
+    python = tmp_path / "python.exe"
+    python.touch()
+    app = tmp_path / "app"
+    app.mkdir()
+    payload = {
+        "variant": "cpu",
+        "python_version": "3.12.10",
+        "torch_version": "2.9.1+cpu",
+        "cuda_version": "",
+        "device_name": "CPU",
+        "compute_capability": [0, 0],
+        "free_memory": 0,
+        "total_memory": 0,
+    }
+    completed = subprocess.CompletedProcess([], 0, json.dumps(payload) + "\n", "")
+    with patch("launcher.engine.subprocess.run", return_value=completed) as mocked:
+        result = probe_engine(python, app, variant="cpu")
+    assert result.compatible
+    assert result.variant == "cpu"
+    assert result.cuda_version == ""
+    command = mocked.call_args.args[0]
+    assert command[-1] == "cpu"
+    assert "conv3d" in command[2]
+
+
+def test_cpu_engine_environment_marks_cpu_runtime(tmp_path: Path) -> None:
+    prefix = tmp_path / "engine"
+    scripts = prefix / "Scripts"
+    scripts.mkdir(parents=True)
+    python = scripts / "python.exe"
+    python.touch()
+    app = tmp_path / "app"
+    app.mkdir()
+    environment = engine_environment(EngineProbe(str(python), True, "ok", variant="cpu"), app)
+    assert environment["SPIMAGING_CUDA_REQUIRED"] == "0"
+    assert environment["SPIMAGING_RUNTIME_VARIANT"] == "cpu"
+
+
+def test_first_launch_choice_is_persisted_without_touching_user_conda(tmp_path: Path) -> None:
+    args = build_parser().parse_args(["--install-root", str(tmp_path)])
+    assert _load_engine_choice(args) is None
+    _save_engine_choice(tmp_path, "cpu")
+    assert _load_engine_choice(args) == "cpu"
+    payload = json.loads((tmp_path / "metadata" / "engine-choice.json").read_text(encoding="utf-8"))
+    assert payload["variant"] == "cpu"
+
+
+def test_cpu_and_cuda_engine_records_can_coexist(tmp_path: Path) -> None:
+    app = tmp_path / "app"
+    app.mkdir()
+    manager = CudaEngineManager(tmp_path, app)
+    manager.save(EngineProbe("C:/cpu/python.exe", True, "ok", variant="cpu"), source="managed")
+    manager.save(EngineProbe("C:/cuda/python.exe", True, "ok", variant="cuda"), source="managed")
+    assert (tmp_path / "metadata" / "engine-cpu.json").is_file()
+    assert (tmp_path / "metadata" / "engine-cuda.json").is_file()
+    active = json.loads((tmp_path / "metadata" / "engine.json").read_text(encoding="utf-8"))
+    assert active["variant"] == "cuda"
+
+
+def test_dependency_install_keeps_cuda_torch_pinned(tmp_path: Path) -> None:
+    app = tmp_path / "app"
+    app.mkdir()
+    uv = tmp_path / "uv.exe"
+    uv.touch()
+    manager = CudaEngineManager(tmp_path, app)
+    commands: list[list[str]] = []
+
+    def capture(command, _progress, **_kwargs):
+        commands.append(list(command))
+
+    probe = EngineProbe(
+        str(tmp_path / "engine" / "Scripts" / "python.exe"),
+        True,
+        "ok",
+        torch_version="2.9.1+cu128",
+        cuda_version="12.8",
+        variant="cuda",
+    )
+    with (
+        patch.object(manager, "locate_uv", return_value=uv),
+        patch.object(manager, "_run_install_command", side_effect=capture),
+        patch("launcher.engine.probe_engine", return_value=probe),
+    ):
+        manager.install(NvidiaDevice("RTX 5070 Ti", "610.62", (12, 0)), variant="cuda")
+
+    dependency_command = commands[2]
+    assert "torch==2.9.1+cu128" in dependency_command
+    assert "https://download.pytorch.org/whl/cu128" in dependency_command
+    assert "https://pypi.org/simple" in dependency_command
+    assert "unsafe-best-match" in dependency_command
+
+
+def test_failed_attempt_directory_is_removed_but_cache_is_retained(tmp_path: Path) -> None:
+    app = tmp_path / "app"
+    app.mkdir()
+    uv = tmp_path / "uv.exe"
+    uv.touch()
+    manager = CudaEngineManager(tmp_path, app)
+    events: list[EngineProgress] = []
+
+    def create_then_fail(command, _progress, **_kwargs):
+        Path(command[-1]).mkdir(parents=True, exist_ok=True)
+        raise LauncherError("network interrupted")
+
+    with (
+        patch.object(manager, "locate_uv", return_value=uv),
+        patch.object(manager, "_run_install_command", side_effect=create_then_fail),
+        pytest.raises(LauncherError, match="network interrupted"),
+    ):
+        manager.install(
+            NvidiaDevice("RTX 5070 Ti", "610.62", (12, 0)),
+            variant="cuda",
+            progress=events.append,
+        )
+    releases = tmp_path / "engine" / "releases"
+    assert releases.is_dir()
+    assert list(releases.iterdir()) == []
+    assert (tmp_path / "engine" / "cache" / "cuda").is_dir()
+    assert any("已清理本次失败环境" in event.message for event in events)
 
 
 def test_engine_environment_isolates_user_python_and_marks_cuda_required(

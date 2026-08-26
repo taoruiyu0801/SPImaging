@@ -323,7 +323,7 @@ class MainWindow(QMainWindow):
                 tr("MainWindow", "运行环境修复"),
                 tr(
                     "MainWindow",
-                    "源代码模式没有安装启动器；请在当前 Python 环境中修复 CUDA PyTorch。安装版会重新检测或安装计算引擎。",
+                    "源代码模式没有安装启动器；请在当前 Python 环境中准备 PyTorch。安装版可重新选择并修复 CPU/GPU 计算环境。",
                 ),
             )
             return
@@ -336,8 +336,8 @@ class MainWindow(QMainWindow):
             return
         answer = QMessageBox.question(
             self,
-            tr("MainWindow", "修复 CUDA 计算引擎"),
-            tr("MainWindow", "软件将关闭，由启动器重新检测或安装 CUDA 计算引擎。不会安装显卡驱动，也不会使用 Conda。是否继续？"),
+            tr("MainWindow", "切换或修复计算环境"),
+            tr("MainWindow", "软件将关闭，由启动器重新选择 CPU/GPU 并检测或安装相应计算环境。不会安装显卡驱动，也不会使用 Conda。是否继续？"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
