@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 from unittest.mock import patch
@@ -16,6 +17,7 @@ from launcher.engine import (
     EngineProbe,
     EngineProgress,
     NvidiaDevice,
+    _install_environment,
     engine_environment,
     probe_engine,
     select_cuda_profile,
@@ -100,6 +102,7 @@ def test_cpu_profile_and_real_conv3d_probe_are_separate_from_cuda(tmp_path: Path
     assert result.compatible
     assert result.variant == "cpu"
     assert result.cuda_version == ""
+    assert result.reason == "CPU 张量与 3D 卷积自检通过"
     command = mocked.call_args.args[0]
     assert command[-1] == "cpu"
     assert "conv3d" in command[2]
@@ -166,10 +169,61 @@ def test_dependency_install_keeps_cuda_torch_pinned(tmp_path: Path) -> None:
         manager.install(NvidiaDevice("RTX 5070 Ti", "610.62", (12, 0)), variant="cuda")
 
     dependency_command = commands[2]
+    python_command = commands[0]
+    assert "--managed-python" in python_command
+    assert "--python-preference" not in python_command
+    assert python_command[python_command.index("--python") + 1] == "3.12.13"
     assert "torch==2.9.1+cu128" in dependency_command
     assert "https://download.pytorch.org/whl/cu128" in dependency_command
     assert "https://pypi.org/simple" in dependency_command
     assert "unsafe-best-match" in dependency_command
+
+
+def test_installer_environment_ignores_host_python_conda_and_hermes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uv = tmp_path / "SPImaging" / "tools" / "uv.exe"
+    uv.parent.mkdir(parents=True)
+    uv.touch()
+    hermes = tmp_path / "hermes" / "hermes-agent" / "venv" / "Scripts"
+    conda = tmp_path / "miniconda3" / "Scripts"
+    codex = tmp_path / "codex-runtimes" / "dependencies" / "bin"
+    monkeypatch.setenv("PATH", os.pathsep.join((str(hermes), str(conda), str(codex))))
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path / "host-python"))
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "shadow-modules"))
+    monkeypatch.setenv("PYTHONUSERBASE", str(tmp_path / "user-site"))
+    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "host-venv"))
+    monkeypatch.setenv("CONDA_PREFIX", str(tmp_path / "host-conda"))
+    monkeypatch.setenv("UV_PYTHON", str(tmp_path / "host-python.exe"))
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path / "host-conda" / "ssl" / "certs"))
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "host-conda" / "ssl" / "cacert.pem"))
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(tmp_path / "organization-ca.pem"))
+
+    private_python = tmp_path / "private-python"
+    environment = _install_environment(
+        uv,
+        {
+            "UV_PYTHON_INSTALL_DIR": str(private_python),
+            "UV_CACHE_DIR": str(tmp_path / "cache"),
+        },
+    )
+
+    clean_path = environment["PATH"].lower()
+    assert str(uv.parent).lower() in clean_path
+    assert "hermes" not in clean_path
+    assert "conda" not in clean_path
+    assert "codex" not in clean_path
+    assert environment["UV_MANAGED_PYTHON"] == "1"
+    assert environment["UV_PYTHON_INSTALL_DIR"] == str(private_python)
+    assert "PYTHONHOME" not in environment
+    assert "PYTHONPATH" not in environment
+    assert "PYTHONUSERBASE" not in environment
+    assert "VIRTUAL_ENV" not in environment
+    assert "CONDA_PREFIX" not in environment
+    assert "UV_PYTHON" not in environment
+    assert "SSL_CERT_DIR" not in environment
+    assert "SSL_CERT_FILE" not in environment
+    assert environment["REQUESTS_CA_BUNDLE"] == str(tmp_path / "organization-ca.pem")
 
 
 def test_failed_attempt_directory_is_removed_but_cache_is_retained(tmp_path: Path) -> None:

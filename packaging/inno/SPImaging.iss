@@ -13,7 +13,7 @@
 
 #define MyAppName "SPImaging"
 #define MyAppPublisher "SPImaging contributors"
-#define MyAppURL "https://github.com/ewellchen/SPImaging"
+#define MyAppURL "https://github.com/taoruiyu0801/SPImaging"
 
 [Setup]
 AppId={{EE8E9266-10AF-4EBF-9D52-8B2910589178}
