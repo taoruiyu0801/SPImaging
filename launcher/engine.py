@@ -552,6 +552,20 @@ def _directory_size(root: Path) -> int:
     return total
 
 
+def _is_untrusted_mount_point_error(error: BaseException) -> bool:
+    """Recognize the Windows 11/uv junction traversal failure (Win32 448)."""
+
+    message = str(error).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "os error 448",
+            "untrusted mount point",
+            "不受信任的装入点",
+        )
+    )
+
+
 class EngineManager:
     def __init__(self, install_root: str | Path, app_root: str | Path) -> None:
         self.install_root = Path(install_root).expanduser().resolve()
@@ -743,9 +757,131 @@ class EngineManager:
         returncode = process.wait()
         reader.join(timeout=2)
         if returncode != 0:
-            detail = lines[-1] if lines else f"exit code {returncode}"
+            detail = "\n".join(lines[-8:]) if lines else f"exit code {returncode}"
             raise LauncherError(f"{label}失败：{detail}")
         _emit(progress, stage, step, total_steps, end_percent, f"{label}完成", kind="log")
+
+    def _find_exact_managed_python(
+        self,
+        python_root: Path,
+        environment_overrides: dict[str, str],
+        progress: EngineProgressCallback | None,
+    ) -> Path | None:
+        """Find and execute-check uv's full-version Python, avoiding its minor junction.
+
+        Some Windows 11 systems reject traversal of uv's ``cpython-3.12-*``
+        Junction with Win32 error 448.  The downloaded full-version directory
+        is a normal directory and remains usable, so validate that interpreter
+        directly before using the standard-library ``venv`` module.
+        """
+
+        pattern = f"cpython-{ENGINE_PYTHON_VERSION}-*-none"
+        executable_parts = ("python.exe",) if os.name == "nt" else ("bin", "python3")
+        version_program = (
+            "import sys; print('.'.join(str(value) for value in sys.version_info[:3]))"
+        )
+        try:
+            installations = sorted(python_root.glob(pattern), key=lambda path: path.name.casefold())
+        except OSError:
+            return None
+        for installation in installations:
+            candidate = installation.joinpath(*executable_parts)
+            if not candidate.is_file():
+                continue
+            try:
+                completed = subprocess.run(
+                    [str(candidate), "-I", "-c", version_program],
+                    cwd=self.install_root,
+                    env=_install_environment(candidate, environment_overrides),
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=20,
+                    creationflags=_creationflags(),
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            reported = completed.stdout.strip().splitlines()
+            if completed.returncode == 0 and reported and reported[-1].strip() == ENGINE_PYTHON_VERSION:
+                validated = candidate.resolve()
+                _emit(
+                    progress,
+                    "python",
+                    2,
+                    6,
+                    6,
+                    f"已验证下载缓存中的 Python {ENGINE_PYTHON_VERSION}：{validated}",
+                    kind="log",
+                )
+                return validated
+        return None
+
+    def _validate_private_venv(self, python: Path, exact_python: Path) -> None:
+        """Reject a venv that uv or Python redirected through a minor Junction."""
+
+        target = python.parent.parent if python.parent.name.casefold() in {"scripts", "bin"} else python.parent
+        config = target / "pyvenv.cfg"
+        try:
+            values = {
+                key.strip().casefold(): value.strip()
+                for line in config.read_text(encoding="utf-8").splitlines()
+                if "=" in line
+                for key, value in (line.split("=", 1),)
+            }
+        except OSError as error:
+            raise LauncherError(f"无法验证新私有环境的 pyvenv.cfg：{error}") from error
+
+        def normalized(value: str | Path) -> str:
+            return os.path.normcase(os.path.abspath(os.fspath(value)))
+
+        expected_home = exact_python.parent
+        configured_home = values.get("home", "")
+        if not configured_home or normalized(configured_home) != normalized(expected_home):
+            raise LauncherError(
+                "新私有环境仍依赖 Python minor-version Junction；"
+                f"期望 home={expected_home}，实际 home={configured_home or '缺失'}"
+            )
+
+        program = (
+            "import json,sys; print(json.dumps({"
+            "'version':sys.version.split()[0],"
+            "'base_prefix':sys.base_prefix,"
+            "'base_executable':getattr(sys,'_base_executable','')"
+            "},ensure_ascii=False))"
+        )
+        try:
+            completed = subprocess.run(
+                [str(python), "-I", "-c", program],
+                cwd=self.install_root,
+                env=_install_environment(python, {}),
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                creationflags=_creationflags(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise LauncherError(f"无法启动新私有环境 Python：{error}") from error
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "未知错误").strip()
+            raise LauncherError(f"新私有环境 Python 启动失败：{detail}")
+        try:
+            payload = json.loads(completed.stdout.strip().splitlines()[-1])
+        except (IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise LauncherError(f"新私有环境 Python 身份输出无法解析：{error}") from error
+        if (
+            payload.get("version") != ENGINE_PYTHON_VERSION
+            or normalized(str(payload.get("base_prefix", ""))) != normalized(expected_home)
+            or normalized(str(payload.get("base_executable", ""))) != normalized(exact_python)
+        ):
+            raise LauncherError(
+                "新私有环境 Python 身份验证失败，可能仍经过不受信任的 Junction："
+                f"{payload}"
+            )
 
     def install(
         self,
@@ -801,25 +937,101 @@ class EngineManager:
                 self._discard_failed_target(target, releases_root, progress)
                 raise
 
-        run_step(
-            [
+        python_activity_roots = (target, cache_root, python_root)
+        python_step = {
+            "stage": "python",
+            "step": 2,
+            "total_steps": 6,
+            "start_percent": 5,
+            "end_percent": 15,
+            "activity_roots": python_activity_roots,
+            "environment_overrides": environment_overrides,
+        }
+
+        exact_python = self._find_exact_managed_python(
+            python_root,
+            environment_overrides,
+            progress,
+        )
+        if exact_python is None:
+            download_error: Exception | None = None
+            download_command = [
                 str(uv),
-                "venv",
-                "--python",
+                "python",
+                "install",
                 ENGINE_PYTHON_VERSION,
                 "--managed-python",
+                "--install-dir",
+                str(python_root),
+                "--no-bin",
+                "--no-registry",
+            ]
+            try:
+                self._run_install_command(
+                    download_command,
+                    progress,
+                    stage="python",
+                    step=2,
+                    total_steps=6,
+                    start_percent=5,
+                    end_percent=9,
+                    label=f"下载 Python {ENGINE_PYTHON_VERSION}",
+                    activity_roots=python_activity_roots,
+                    environment_overrides=environment_overrides,
+                )
+            except Exception as error:
+                if not _is_untrusted_mount_point_error(error):
+                    raise
+                download_error = error
+                _emit(
+                    progress,
+                    "python",
+                    2,
+                    6,
+                    7,
+                    "Python 已下载，但 uv 创建版本链接时遇到 Windows 错误 448；"
+                    "将忽略该链接并验证完整版本目录",
+                    kind="log",
+                )
+            exact_python = self._find_exact_managed_python(
+                python_root,
+                environment_overrides,
+                progress,
+            )
+            if exact_python is None:
+                message = f"下载后仍未找到可执行的 Python {ENGINE_PYTHON_VERSION} 完整版本目录"
+                if download_error is not None:
+                    raise LauncherError(message) from download_error
+                raise LauncherError(message)
+
+        run_step(
+            [
+                str(exact_python),
+                "-I",
+                "-m",
+                "venv",
+                "--copies",
+                "--without-pip",
                 str(target),
             ],
-            stage="python",
-            step=2,
-            total_steps=6,
-            start_percent=5,
-            end_percent=15,
-            label=f"创建 Python {ENGINE_PYTHON_VERSION} 私有环境",
-            activity_roots=(target, cache_root, python_root),
-            environment_overrides=environment_overrides,
+            label=f"复制创建 Python {ENGINE_PYTHON_VERSION} 私有环境（不使用 Junction）",
+            **python_step,
         )
         python = target / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        try:
+            self._validate_private_venv(python, exact_python)
+        except Exception:
+            self._discard_failed_target(target, releases_root, progress)
+            raise
+        _emit(
+            progress,
+            "python",
+            2,
+            6,
+            15,
+            f"私有环境路径验证通过：base Python 为完整版本 {exact_python.parent.name}",
+            kind="log",
+        )
         run_step(
             [
                 str(uv),
@@ -827,6 +1039,8 @@ class EngineManager:
                 "install",
                 "--python",
                 str(python),
+                "--no-managed-python",
+                "--no-python-downloads",
                 profile.torch_requirement,
                 "--index-url",
                 profile.index_url,
@@ -847,6 +1061,8 @@ class EngineManager:
                 "install",
                 "--python",
                 str(python),
+                "--no-managed-python",
+                "--no-python-downloads",
                 profile.torch_requirement,
                 *BASE_REQUIREMENTS,
                 "--index-url",
