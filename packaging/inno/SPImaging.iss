@@ -11,7 +11,8 @@
   #define MySignedBuild "0"
 #endif
 
-#define MyAppName "SPImaging"
+#define MyCopyrightVersion "V1.0"
+#define MyAppName "SPImaging单光子三维成像仿真与智能重建软件"
 #define MyAppPublisher "SPImaging contributors"
 #define MyAppURL "https://github.com/taoruiyu0801/SPImaging"
 
@@ -19,7 +20,7 @@
 AppId={{EE8E9266-10AF-4EBF-9D52-8B2910589178}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-AppVerName={#MyAppName} {#MyAppVersion}
+AppVerName={#MyAppName} {#MyCopyrightVersion} (build {#MyAppVersion})
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}/issues

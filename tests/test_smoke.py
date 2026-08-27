@@ -29,6 +29,8 @@ def test_package_import() -> None:
     import spimaging
 
     assert spimaging.__version__ == "0.2.0-beta.1"
+    assert spimaging.PRODUCT_VERSION == "V1.0"
+    assert spimaging.product_display_name() == "SPImaging单光子三维成像仿真与智能重建软件 V1.0"
     assert Path(spimaging.__file__).resolve().is_relative_to(REPOSITORY_ROOT)
 
 

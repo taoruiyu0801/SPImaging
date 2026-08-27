@@ -1,0 +1,5 @@
+SPImaging单光子三维成像仿真与智能重建软件 V1.0
+Technical build: 0.2.0-beta.1
+Release channel: unsigned beta
+Software finalization date: 2026-08-27
+

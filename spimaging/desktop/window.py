@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 
+from spimaging import PRODUCT_VERSION, __version__, product_display_name
 from spimaging.appcore.config import RunConfig
 from spimaging.desktop.controller import WorkerController
 from spimaging.desktop.dependency import require_pyside6
@@ -71,7 +72,7 @@ class MainWindow(QMainWindow):
         self.worker = WorkerController(self, python_executable=python_executable)
         self._pending_close = False
 
-        self.setWindowTitle(tr("MainWindow", "SPImaging 单光子成像工作台"))
+        self.setWindowTitle(product_display_name())
         self.setMinimumSize(1120, 720)
         self.resize(1380, 900)
         self._build_ui()
@@ -120,7 +121,7 @@ class MainWindow(QMainWindow):
             self.nav_buttons[name] = button
             nav_layout.addWidget(button)
         nav_layout.addStretch(1)
-        beta = QLabel("0.2.0-beta.1 · unsigned beta")
+        beta = QLabel(f"{PRODUCT_VERSION} · build {__version__}\nunsigned beta")
         beta.setObjectName("brandSubtitle")
         beta.setWordWrap(True)
         nav_layout.addWidget(beta)

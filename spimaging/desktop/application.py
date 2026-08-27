@@ -6,6 +6,7 @@ import argparse
 import sys
 from typing import Sequence
 
+from spimaging import PRODUCT_VERSION, __version__, product_display_name
 from spimaging.desktop.dependency import require_pyside6
 
 
@@ -21,8 +22,8 @@ def create_application(argv: Sequence[str] | None = None):
     application = QApplication.instance() or QApplication(list(sys.argv if argv is None else argv))
     QCoreApplication.setOrganizationName("SPImaging")
     QCoreApplication.setApplicationName("SPImaging")
-    QCoreApplication.setApplicationVersion("0.2.0-beta.1")
-    application.setApplicationDisplayName("SPImaging")
+    QCoreApplication.setApplicationVersion(__version__)
+    application.setApplicationDisplayName(product_display_name())
     application.setStyleSheet(APP_STYLESHEET)
     paths = ApplicationPaths.default()
     settings = SettingsStore(paths.settings_file, paths).load()
@@ -35,7 +36,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="spimaging-desktop",
         description="SPImaging PySide6 单光子成像实验工作台",
     )
-    parser.add_argument("--version", action="version", version="SPImaging 0.2.0-beta.1")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"SPImaging {PRODUCT_VERSION} (build {__version__})",
+    )
     parser.add_argument(
         "--smoke-test",
         action="store_true",
