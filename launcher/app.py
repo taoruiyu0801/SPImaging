@@ -501,6 +501,18 @@ def _load_engine_choice(args: argparse.Namespace) -> str | None:
     return str(preference) if preference in {"cpu", "cuda"} else None
 
 
+def _gui_requested_engine_choice(args: argparse.Namespace) -> str | None:
+    """Return only a choice explicitly supplied for this GUI invocation.
+
+    A persisted choice describes the last successfully validated engine, but
+    it must never turn an ordinary double-click into authorization to download
+    or install software.  Explicit ``--runtime cpu``/``--runtime cuda`` calls
+    are used by controlled repair and packaging flows and may start directly.
+    """
+
+    return str(args.runtime) if args.runtime in {"cpu", "cuda"} else None
+
+
 def _save_engine_choice(install_root: Path, variant: str) -> None:
     if variant not in {"cpu", "cuda"}:
         raise ValueError("engine variant must be cpu or cuda")
@@ -550,7 +562,6 @@ def _run_engine_headless(args: argparse.Namespace) -> int:
             variant = "cpu"
     else:
         device = probe_nvidia_device() if variant == "cuda" else None
-    _save_engine_choice(args.install_root, variant)
     if args.install_engine or args.repair_engine:
         probe = manager.install(
             device,
@@ -572,6 +583,7 @@ def _run_engine_headless(args: argparse.Namespace) -> int:
                 f"没有可用的 {variant.upper()} 计算引擎（{detail}）。可安装配置：{profile}；"
                 "请使用 --install-engine。"
             )
+    _save_engine_choice(args.install_root, probe.variant)
     print(_engine_summary(probe))
     if not args.no_launch:
         process = launch_desktop_with_engine(
@@ -683,13 +695,12 @@ def _run_engine_gui(args: argparse.Namespace) -> int:
         cpu_button.configure(state=state)
         gpu_button.configure(state=state)
 
-    def run_variant(variant: str, *, force: bool = False) -> None:
+    def run_variant(variant: str, *, force: bool = False, explicit: bool = False) -> None:
         nonlocal selected_variant, busy
         if busy:
             return
         selected_variant = variant
         busy = True
-        _save_engine_choice(args.install_root, variant)
         set_choice_enabled(False)
         retry_button.configure(state="disabled")
         choose_button.configure(state="disabled")
@@ -698,7 +709,8 @@ def _run_engine_gui(args: argparse.Namespace) -> int:
         label = "CPU" if variant == "cpu" else "NVIDIA GPU"
         status.set(f"正在准备 {label} 运行环境")
         detail.set("下面会持续显示每一步和完整日志；长时间下载时每秒都会显示已用时间。")
-        append_log(record(f"用户选择 {label} 模式；应用目录：{app_root}"))
+        choice_source = "命令行明确指定" if explicit else "用户选择"
+        append_log(record(f"{choice_source} {label} 模式；应用目录：{app_root}"))
 
         def work() -> None:
             try:
@@ -802,6 +814,7 @@ def _run_engine_gui(args: argparse.Namespace) -> int:
                 elif kind == "done":
                     probe = payload  # type: ignore[assignment]
                     busy = False
+                    _save_engine_choice(args.install_root, probe.variant)
                     progress_value.set(100)
                     status.set(f"{probe.variant.upper()} 环境已通过自检")
                     step_text.set("第 6/6 步 · complete")
@@ -833,10 +846,10 @@ def _run_engine_gui(args: argparse.Namespace) -> int:
         if root.winfo_exists():
             root.after(100, poll)
 
-    initial = None if args.repair_engine else _load_engine_choice(args)
+    initial = _gui_requested_engine_choice(args)
     append_log(record(f"启动器开始；日志文件：{log_path}"))
     if initial in {"cpu", "cuda"}:
-        root.after(150, lambda value=initial: run_variant(value))
+        root.after(150, lambda value=initial: run_variant(value, explicit=True))
     else:
         set_choice_enabled(True)
     root.after(100, poll)

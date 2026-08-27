@@ -10,7 +10,13 @@ from unittest.mock import patch
 
 import pytest
 
-from launcher.app import _load_engine_choice, _save_engine_choice, build_parser
+from launcher.app import (
+    _gui_requested_engine_choice,
+    _load_engine_choice,
+    _run_engine_headless,
+    _save_engine_choice,
+    build_parser,
+)
 from launcher.engine import (
     CudaEngineManager,
     CPU_PROFILE,
@@ -130,6 +136,77 @@ def test_first_launch_choice_is_persisted_without_touching_user_conda(tmp_path: 
     assert payload["variant"] == "cpu"
 
 
+def test_gui_ignores_stale_choice_unless_runtime_is_explicit(tmp_path: Path) -> None:
+    _save_engine_choice(tmp_path, "cuda")
+    ordinary = build_parser().parse_args(["--install-root", str(tmp_path)])
+    automatic = build_parser().parse_args(
+        ["--install-root", str(tmp_path), "--runtime", "auto"]
+    )
+    explicit_cpu = build_parser().parse_args(
+        ["--install-root", str(tmp_path), "--runtime", "cpu"]
+    )
+    explicit_cuda = build_parser().parse_args(
+        ["--install-root", str(tmp_path), "--runtime", "cuda"]
+    )
+
+    assert _load_engine_choice(ordinary) == "cuda"
+    assert _gui_requested_engine_choice(ordinary) is None
+    assert _gui_requested_engine_choice(automatic) is None
+    assert _gui_requested_engine_choice(explicit_cpu) == "cpu"
+    assert _gui_requested_engine_choice(explicit_cuda) == "cuda"
+
+
+def test_failed_headless_install_does_not_persist_choice(tmp_path: Path) -> None:
+    args = build_parser().parse_args(
+        [
+            "--install-root",
+            str(tmp_path),
+            "--runtime",
+            "cpu",
+            "--headless",
+            "--install-engine",
+            "--no-launch",
+        ]
+    )
+    manager = CudaEngineManager(tmp_path, tmp_path / "app")
+    with (
+        patch("launcher.app.resolve_app_root", return_value=tmp_path / "app"),
+        patch("launcher.app.CudaEngineManager", return_value=manager),
+        patch.object(manager, "install", side_effect=LauncherError("installation failed")),
+        pytest.raises(LauncherError, match="installation failed"),
+    ):
+        _run_engine_headless(args)
+
+    assert not (tmp_path / "metadata" / "engine-choice.json").exists()
+
+
+def test_successful_headless_validation_persists_actual_variant(tmp_path: Path) -> None:
+    args = build_parser().parse_args(
+        [
+            "--install-root",
+            str(tmp_path),
+            "--runtime",
+            "cpu",
+            "--headless",
+            "--install-engine",
+            "--no-launch",
+        ]
+    )
+    probe = EngineProbe("C:/private/python.exe", True, "ok", variant="cpu")
+    manager = CudaEngineManager(tmp_path, tmp_path / "app")
+    with (
+        patch("launcher.app.resolve_app_root", return_value=tmp_path / "app"),
+        patch("launcher.app.CudaEngineManager", return_value=manager),
+        patch("launcher.app.probe_nvidia_device") as nvidia_probe,
+        patch.object(manager, "install", return_value=probe),
+    ):
+        assert _run_engine_headless(args) == 0
+
+    nvidia_probe.assert_not_called()
+    payload = json.loads((tmp_path / "metadata" / "engine-choice.json").read_text(encoding="utf-8"))
+    assert payload["variant"] == "cpu"
+
+
 def test_cpu_and_cuda_engine_records_can_coexist(tmp_path: Path) -> None:
     app = tmp_path / "app"
     app.mkdir()
@@ -147,6 +224,13 @@ def test_dependency_install_keeps_cuda_torch_pinned(tmp_path: Path) -> None:
     app.mkdir()
     uv = tmp_path / "uv.exe"
     uv.touch()
+    exact_python = (
+        tmp_path
+        / "engine"
+        / "python"
+        / "cpython-3.12.13-windows-x86_64-none"
+        / "python.exe"
+    )
     manager = CudaEngineManager(tmp_path, app)
     commands: list[list[str]] = []
 
@@ -163,20 +247,193 @@ def test_dependency_install_keeps_cuda_torch_pinned(tmp_path: Path) -> None:
     )
     with (
         patch.object(manager, "locate_uv", return_value=uv),
+        patch.object(
+            manager,
+            "_find_exact_managed_python",
+            side_effect=(None, exact_python),
+        ),
+        patch.object(manager, "_validate_private_venv"),
         patch.object(manager, "_run_install_command", side_effect=capture),
         patch("launcher.engine.probe_engine", return_value=probe),
     ):
         manager.install(NvidiaDevice("RTX 5070 Ti", "610.62", (12, 0)), variant="cuda")
 
-    dependency_command = commands[2]
-    python_command = commands[0]
-    assert "--managed-python" in python_command
-    assert "--python-preference" not in python_command
-    assert python_command[python_command.index("--python") + 1] == "3.12.13"
+    download_command = commands[0]
+    venv_command = commands[1]
+    dependency_command = commands[3]
+    assert download_command[1:3] == ["python", "install"]
+    assert "3.12.13" in download_command
+    assert "--managed-python" in download_command
+    assert "--no-bin" in download_command
+    assert "--no-registry" in download_command
+    assert venv_command[0] == str(exact_python)
+    assert venv_command[1:4] == ["-I", "-m", "venv"]
+    assert "--copies" in venv_command
+    assert "--without-pip" in venv_command
     assert "torch==2.9.1+cu128" in dependency_command
     assert "https://download.pytorch.org/whl/cu128" in dependency_command
     assert "https://pypi.org/simple" in dependency_command
     assert "unsafe-best-match" in dependency_command
+
+
+def test_existing_full_version_python_avoids_uv_minor_version_link(tmp_path: Path) -> None:
+    app = tmp_path / "app"
+    app.mkdir()
+    uv = tmp_path / "uv.exe"
+    uv.touch()
+    exact_python = (
+        tmp_path
+        / "engine"
+        / "python"
+        / "cpython-3.12.13-windows-x86_64-none"
+        / "python.exe"
+    )
+    exact_python.parent.mkdir(parents=True)
+    exact_python.touch()
+    manager = CudaEngineManager(tmp_path, app)
+    commands: list[list[str]] = []
+
+    def capture(command, _progress, **_kwargs):
+        commands.append(list(command))
+
+    probe = EngineProbe("C:/managed/python.exe", True, "ok", variant="cpu")
+    version_result = subprocess.CompletedProcess([], 0, "3.12.13\n", "")
+    with (
+        patch.object(manager, "locate_uv", return_value=uv),
+        patch("launcher.engine.subprocess.run", return_value=version_result),
+        patch.object(manager, "_validate_private_venv"),
+        patch.object(manager, "_run_install_command", side_effect=capture),
+        patch("launcher.engine.probe_engine", return_value=probe),
+    ):
+        manager.install(None, variant="cpu")
+
+    venv_command = commands[0]
+    assert venv_command[0] == str(exact_python.resolve())
+    assert venv_command[1:4] == ["-I", "-m", "venv"]
+    assert "--copies" in venv_command
+    assert "--without-pip" in venv_command
+    assert all(command[1:3] != ["python", "install"] for command in commands)
+
+
+def test_error_448_recovers_with_downloaded_exact_python(tmp_path: Path) -> None:
+    app = tmp_path / "app"
+    app.mkdir()
+    uv = tmp_path / "uv.exe"
+    uv.touch()
+    exact_python = (
+        tmp_path
+        / "engine"
+        / "python"
+        / "cpython-3.12.13-windows-x86_64-none"
+        / "python.exe"
+    )
+    manager = CudaEngineManager(tmp_path, app)
+    commands: list[list[str]] = []
+
+    def fail_once_then_capture(command, _progress, **_kwargs):
+        commands.append(list(command))
+        if len(commands) == 1:
+            exact_python.parent.mkdir(parents=True)
+            exact_python.touch()
+            raise LauncherError("无法遍历该路径，因为它包含不受信任的装入点。 (os error 448)")
+
+    probe = EngineProbe("C:/managed/python.exe", True, "ok", variant="cpu")
+    version_result = subprocess.CompletedProcess([], 0, "3.12.13\n", "")
+    with (
+        patch.object(manager, "locate_uv", return_value=uv),
+        patch("launcher.engine.subprocess.run", return_value=version_result),
+        patch.object(manager, "_validate_private_venv"),
+        patch.object(manager, "_run_install_command", side_effect=fail_once_then_capture),
+        patch("launcher.engine.probe_engine", return_value=probe),
+    ):
+        manager.install(None, variant="cpu")
+
+    assert commands[0][1:3] == ["python", "install"]
+    assert "--managed-python" in commands[0]
+    recovery_command = commands[1]
+    assert recovery_command[0] == str(exact_python.resolve())
+    assert recovery_command[1:4] == ["-I", "-m", "venv"]
+    assert "--copies" in recovery_command
+    assert "--without-pip" in recovery_command
+
+
+def test_error_448_without_usable_exact_python_still_fails(tmp_path: Path) -> None:
+    app = tmp_path / "app"
+    app.mkdir()
+    uv = tmp_path / "uv.exe"
+    uv.touch()
+    manager = CudaEngineManager(tmp_path, app)
+    commands: list[list[str]] = []
+
+    def fail(command, _progress, **_kwargs):
+        commands.append(list(command))
+        raise LauncherError("untrusted mount point (os error 448)")
+
+    with (
+        patch.object(manager, "locate_uv", return_value=uv),
+        patch.object(manager, "_run_install_command", side_effect=fail),
+        pytest.raises(LauncherError, match="仍未找到可执行的 Python"),
+    ):
+        manager.install(None, variant="cpu")
+
+    assert len(commands) == 1
+
+
+def test_non_448_python_creation_failure_does_not_retry(tmp_path: Path) -> None:
+    app = tmp_path / "app"
+    app.mkdir()
+    uv = tmp_path / "uv.exe"
+    uv.touch()
+    manager = CudaEngineManager(tmp_path, app)
+    commands: list[list[str]] = []
+
+    def fail(command, _progress, **_kwargs):
+        commands.append(list(command))
+        raise LauncherError("network interrupted")
+
+    with (
+        patch.object(manager, "locate_uv", return_value=uv),
+        patch.object(manager, "_run_install_command", side_effect=fail),
+        pytest.raises(LauncherError, match="network interrupted"),
+    ):
+        manager.install(None, variant="cpu")
+
+    assert len(commands) == 1
+
+
+def test_private_venv_validation_rejects_minor_version_junction_home(tmp_path: Path) -> None:
+    app = tmp_path / "app"
+    app.mkdir()
+    manager = CudaEngineManager(tmp_path, app)
+    exact_python = (
+        tmp_path
+        / "engine"
+        / "python"
+        / "cpython-3.12.13-windows-x86_64-none"
+        / "python.exe"
+    )
+    exact_python.parent.mkdir(parents=True)
+    exact_python.touch()
+    target = tmp_path / "engine" / "releases" / "cpu"
+    python = target / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    config = target / "pyvenv.cfg"
+    config.write_text(f"home = {exact_python.parent}\nversion = 3.12.13\n", encoding="utf-8")
+    identity = {
+        "version": "3.12.13",
+        "base_prefix": str(exact_python.parent),
+        "base_executable": str(exact_python),
+    }
+    completed = subprocess.CompletedProcess([], 0, json.dumps(identity) + "\n", "")
+
+    with patch("launcher.engine.subprocess.run", return_value=completed):
+        manager._validate_private_venv(python, exact_python)
+
+    minor_home = exact_python.parent.with_name("cpython-3.12-windows-x86_64-none")
+    config.write_text(f"home = {minor_home}\nversion = 3.12.13\n", encoding="utf-8")
+    with pytest.raises(LauncherError, match="minor-version Junction"):
+        manager._validate_private_venv(python, exact_python)
 
 
 def test_installer_environment_ignores_host_python_conda_and_hermes(
@@ -240,6 +497,11 @@ def test_failed_attempt_directory_is_removed_but_cache_is_retained(tmp_path: Pat
 
     with (
         patch.object(manager, "locate_uv", return_value=uv),
+        patch.object(
+            manager,
+            "_find_exact_managed_python",
+            return_value=tmp_path / "engine" / "python" / "exact" / "python.exe",
+        ),
         patch.object(manager, "_run_install_command", side_effect=create_then_fail),
         pytest.raises(LauncherError, match="network interrupted"),
     ):
